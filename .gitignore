@@ -3,3 +3,6 @@ __pycache__/
 config.json
 .venv/
 venv/
+build/
+dist/
+*.spec

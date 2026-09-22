@@ -49,8 +49,26 @@ from hotkey_logic import DEFAULT_RULES, SLOT_KEYS_DEFAULT, HotkeyManager
 from i18n import STRINGS, slot_label
 from steam_locate import find_cs2_root, get_cfg_dir
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-ICON_PATH = os.path.join(BASE_DIR, "icon.png")
+if getattr(sys, "frozen", False):
+    # PyInstaller --onefile: __file__ does not exist, settings live next to the exe
+    BASE_DIR = os.path.dirname(sys.executable)
+    _MEIPASS = getattr(sys, "_MEIPASS", None)
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    _MEIPASS = None
+
+
+def resource_path(name: str) -> str:
+    """Find a bundled asset: exe dir first, then PyInstaller temp dir."""
+    for base in (BASE_DIR, _MEIPASS):
+        if base:
+            candidate = os.path.join(base, name)
+            if os.path.isfile(candidate):
+                return candidate
+    return os.path.join(BASE_DIR, name)
+
+
+ICON_PATH = resource_path("icon.png")
 # QSMARTSWAP_CONFIG override exists so tests never touch the real config.json
 CONFIG_JSON = os.environ.get("QSMARTSWAP_CONFIG", os.path.join(BASE_DIR, "config.json"))
 DEFAULT_PORT = 7777
