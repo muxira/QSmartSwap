@@ -112,6 +112,171 @@ def _name_to_scancode(name: str):
         return None
 
 
+def _codes_for_name(name: str) -> tuple:
+    """Key name -> ALL scan codes (both sides for generic names), () if unknown."""
+    try:
+        import keyboard
+
+        return tuple(keyboard.key_to_scan_codes(_norm_name(name)))
+    except Exception:  # noqa: BLE001
+        return ()
+
+
+def parse_combo_groups(hotkey: str) -> list:
+    """'Ctrl+Q' -> [frozenset(ctrl codes), frozenset(q codes)].
+
+    Generic names ('ctrl') expand to every known code (either side works —
+    legacy behavior). Side-specific names ('right ctrl') exclude the opposite
+    side's codes, so typed combos can also be exact. Captures always store
+    exact singletons (the only fully reliable source).
+    """
+    groups = []
+    for p in (hotkey or "").lower().replace(",", "+").split("+"):
+        p = p.strip()
+        if not p:
+            continue
+        p = _RU_TO_EN.get(p, p)
+        p = _ALIASES.get(p, p)
+        codes = set(_codes_for_name(p))
+        opposite = _OPPOSITE_SIDE.get(p)
+        if opposite:
+            trimmed = codes - set(_codes_for_name(opposite))
+            if trimmed:
+                codes = trimmed
+        groups.append(frozenset(codes))
+    return groups
+
+
+# side-specific name -> opposite side name (tables list both, trim to exact)
+_OPPOSITE_SIDE = {
+    "left ctrl": "right ctrl",
+    "right ctrl": "left ctrl",
+    "left shift": "right shift",
+    "right shift": "left shift",
+    "left alt": "right alt",
+    "right alt": "left alt",
+    "alt gr": "left alt",
+    "left windows": "right windows",
+    "right windows": "left windows",
+}
+
+
+def _coerce_groups(groups) -> list:
+    """[[29],[16]] or [(29,),(16,)] or [29,16-as-singletons...] -> [frozenset, ...].
+
+    Each element is one combo key: an int (exact scan code) or an
+    iterable of acceptable codes.
+    """
+    out = []
+    for g in groups or []:
+        if isinstance(g, int):
+            out.append(frozenset({g}))
+        else:
+            out.append(frozenset(g))
+    return out
+
+
+# --- scan code <-> display name (side/numpad aware) ---
+
+# specific names first so exact codes keep their precise label
+_DISPLAY_CANDIDATES = [
+    "left ctrl", "right ctrl", "left shift", "right shift",
+    "left alt", "right alt", "left windows", "right windows",
+    "alt gr",
+    "esc", "tab", "caps lock", "space", "enter", "backspace",
+    "insert", "home", "pageup", "delete", "end", "pagedown",
+    "up", "down", "left", "right",
+    "num lock", "num 0", "num 1", "num 2", "num 3", "num 4",
+    "num 5", "num 6", "num 7", "num 8", "num 9",
+    "num /", "num *", "num -", "num +", "num enter", "num del",
+    "print screen", "scroll lock", "pause",
+    "ctrl", "shift", "alt", "windows",
+] + [chr(c) for c in range(ord("a"), ord("z") + 1)] + [str(d) for d in range(10)] + [
+    f"f{i}" for i in range(1, 25)
+]
+
+_code_to_name: dict | None = None
+
+
+def _reverse_map() -> dict:
+    global _code_to_name
+    if _code_to_name is None:
+        rev = {}
+        for name in _DISPLAY_CANDIDATES:
+            for code in _codes_for_name(name):
+                rev.setdefault(code, _norm_name(name))
+        _code_to_name = rev
+    return _code_to_name
+
+
+def scancode_display(code: int) -> str:
+    """Scan code -> human label ('right ctrl', 'q', ...), 'sc123' if unknown."""
+    return _reverse_map().get(code, f"sc{code}")
+
+
+def combo_display(codes) -> str:
+    """[285, 16] -> 'right ctrl+q'."""
+    return "+".join(scancode_display(c) for c in codes)
+
+
+def _esc_codes() -> set:
+    return set(_codes_for_name("esc"))
+
+
+class _ComboRecorder:
+    """Collects pressed scan codes in order until all are released.
+
+    Split out for testability — feed it synthetic events without hardware.
+    """
+
+    def __init__(self):
+        self.codes: list = []
+        self.held: set = set()
+        self.finished = False
+
+    def on_event(self, event):
+        sc = getattr(event, "scan_code", None)
+        if not isinstance(sc, int):
+            return
+        if event.event_type == "down":
+            if sc not in self.held:
+                self.held.add(sc)
+                if sc not in self.codes:
+                    self.codes.append(sc)
+        else:
+            self.held.discard(sc)
+            if self.codes and not self.held:
+                self.finished = True
+
+
+def capture_combo(timeout: float = 30.0):
+    """Record a combo by scan code. Returns [codes] in press order,
+    or None on timeout / empty / esc-only (cancel).
+
+    Left/right modifiers and numpad keys are recorded exactly —
+    'right ctrl' and 'left ctrl' are different binds.
+    """
+    import keyboard
+    import time as _time
+
+    rec = _ComboRecorder()
+    h = keyboard.hook(rec.on_event, suppress=False)
+    try:
+        end = _time.time() + timeout
+        while _time.time() < end and not rec.finished:
+            _time.sleep(0.02)
+    finally:
+        try:
+            keyboard.unhook(h)
+        except (KeyError, ValueError, AttributeError):
+            pass
+    if not rec.finished or not rec.codes:
+        return None
+    if set(rec.codes) <= _esc_codes():
+        return None  # esc-only = cancel
+    return list(rec.codes)
+
+
 def _foreground_process_name() -> str | None:
     """Foreground window exe name (lower) or None if undetermined."""
     try:
@@ -165,10 +330,11 @@ class HotkeyManager:
         self._kill_callback = kill_callback  # fired by the kill combo, focus-independent
         self._current_hotkey: str | None = None
         self._current_kill: str | None = None
-        self._required: frozenset = frozenset()
-        self._required_sc: frozenset = frozenset()
-        self._required_kill: frozenset = frozenset()
-        self._required_kill_sc: frozenset = frozenset()
+        # combo = list of groups; group = acceptable scan codes for ONE combo key.
+        # Generic names expand to all codes (either side works), captures store
+        # exact singletons (left/right/numpad are different binds).
+        self._groups: list = []
+        self._kill_groups: list = []
         self.rules: list[dict] = [dict(r) for r in DEFAULT_RULES]
         self.slot_keys: dict[str, str] = dict(SLOT_KEYS_DEFAULT)
         self.debounce_ms = debounce_ms
@@ -178,8 +344,7 @@ class HotkeyManager:
         self._foreground_fn = foreground_fn or _foreground_process_name
         self._hook = None
         self._lock = threading.Lock()
-        self._pressed: set[str] = set()
-        self._pressed_sc: set[int] = set()
+        self._pressed_sc: set = set()
         self._latched = False
         self._kill_latched = False
         self._last_fire = 0.0
@@ -249,49 +414,39 @@ class HotkeyManager:
 
     def _on_key_event(self, event):
         """keyboard.hook callback. Fires with unrelated keys held too:
-        requires required ⊆ pressed, not exact equality. Names OR scan codes.
+        every combo group needs >=1 of its codes pressed, not exact equality.
         The kill combo is checked first and ignores the focus gate."""
-        name = _norm_name(getattr(event, "name", "") or "")
         sc = getattr(event, "scan_code", None)
-        if not name and sc is None:
+        if not isinstance(sc, int):
             return
         fire_main = False
         fire_kill = False
         with self._lock:
             if event.event_type == "down":
-                if name:
-                    self._pressed.add(name)
-                if isinstance(sc, int):
-                    self._pressed_sc.add(sc)
+                self._pressed_sc.add(sc)
             else:
-                if name:
-                    self._pressed.discard(name)
-                if isinstance(sc, int):
-                    self._pressed_sc.discard(sc)
-                if not self._combo_held_locked():
-                    self._latched = False
-                if not self._kill_held_locked():
+                self._pressed_sc.discard(sc)
+                if not self._held_locked(self._kill_groups):
                     self._kill_latched = False
+                if not self._held_locked(self._groups):
+                    self._latched = False
                 return
 
-            # edge: the just-pressed key must belong to the combo
-            name_ok = bool(name)
+            # edge: the just-pressed code must belong to the combo
             if (
-                self._required_kill
+                self._kill_groups
                 and not self._kill_latched
-                and self._kill_held_locked()
-                and ((name_ok and name in self._required_kill)
-                     or (isinstance(sc, int) and sc in self._required_kill_sc))
+                and self._held_locked(self._kill_groups)
+                and any(sc in g for g in self._kill_groups)
             ):
                 self._kill_latched = True
                 fire_kill = True
 
             if (
-                self._required
+                self._groups
                 and not self._latched
-                and self._combo_held_locked()
-                and ((name_ok and name in self._required)
-                     or (isinstance(sc, int) and sc in self._required_sc))
+                and self._held_locked(self._groups)
+                and any(sc in g for g in self._groups)
             ):
                 self._latched = True
                 fire_main = True
@@ -304,19 +459,10 @@ class HotkeyManager:
         if fire_main:
             self._on_hotkey()
 
-    def _combo_held_locked(self) -> bool:
-        if self._required and self._required.issubset(self._pressed):
-            return True
-        if self._required_sc and self._required_sc.issubset(self._pressed_sc):
-            return True
-        return False
-
-    def _kill_held_locked(self) -> bool:
-        if self._required_kill and self._required_kill.issubset(self._pressed):
-            return True
-        if self._required_kill_sc and self._required_kill_sc.issubset(self._pressed_sc):
-            return True
-        return False
+    def _held_locked(self, groups: list) -> bool:
+        return bool(groups) and all(
+            any(c in self._pressed_sc for c in g) for g in groups
+        )
 
     def _effective_active(self, snap_active: str | None) -> str | None:
         """Active slot with prediction applied (for spam faster than 10 Hz GSI)."""
@@ -403,38 +549,41 @@ class HotkeyManager:
         self._predicted_at = time.time()
         self.log_callback(f"[hotkey] {active} -> {target} ('{key_to_send}'){fb_note}{owned_note}")
 
-    def start(self, hotkey: str, kill_hotkey: str | None = None):
+    def start(self, hotkey: str, kill_hotkey: str | None = None,
+              hotkey_groups=None, kill_groups=None):
+        """Bind main + kill combos.
+
+        hotkey/kill_hotkey: display strings ('ctrl+q', 'right ctrl+q').
+        hotkey_groups/kill_groups: exact scan-code groups from capture_combo
+        (e.g. [[29],[16]]) — when given, sides/numpad are exact; otherwise
+        groups are parsed from the display string (generic names match
+        either side — legacy behavior).
+        """
         self.stop()
-        required = parse_combo(hotkey)
-        if not required:
-            self.log_callback("!! Empty hotkey")
+        groups = _coerce_groups(hotkey_groups) if hotkey_groups else parse_combo_groups(hotkey)
+        if not groups or not all(groups):
+            self.log_callback(f"!! Cannot bind '{hotkey}': unknown key in combo")
             return False
-        required_kill = parse_combo(kill_hotkey) if (kill_hotkey or "").strip() else frozenset()
-        if required_kill and required_kill == required:
+        kill_display = (kill_hotkey or "").strip()
+        if kill_display and parse_combo(kill_display) == parse_combo(hotkey):
             self.log_callback("!! Kill hotkey equals main hotkey — kill disabled")
-            required_kill = frozenset()
+            kill_display, kill_groups = "", None
+        kgroups = _coerce_groups(kill_groups) if kill_groups else (
+            parse_combo_groups(kill_display) if kill_display else [])
+        if kill_display and (not kgroups or not all(kgroups)):
+            self.log_callback(f"!! Cannot bind kill '{kill_display}': unknown key in combo")
+            kill_display, kgroups = "", []
         try:
             import keyboard
 
-            def resolve(combo: frozenset) -> frozenset:
-                sc = set()
-                for p in combo:
-                    code = _name_to_scancode(p)
-                    if code is not None:
-                        sc.add(code)
-                return frozenset(sc)
-
             with self._lock:
-                self._pressed = set()
                 self._pressed_sc = set()
                 self._latched = False
                 self._kill_latched = False
-                self._required = required
-                self._required_sc = resolve(required)
-                self._required_kill = required_kill
-                self._required_kill_sc = resolve(required_kill)
+                self._groups = groups
+                self._kill_groups = kgroups
                 self._current_hotkey = hotkey.strip()
-                self._current_kill = (kill_hotkey or "").strip() if required_kill else None
+                self._current_kill = kill_display or None
                 self._hook = keyboard.hook(self._on_key_event, suppress=False)
             self.log_callback(f"Listening hotkey: {self._current_hotkey}")
             if self._current_kill:
@@ -447,13 +596,10 @@ class HotkeyManager:
     def stop(self):
         with self._lock:
             hook, self._hook = self._hook, None
-            self._required = frozenset()
-            self._required_sc = frozenset()
-            self._required_kill = frozenset()
-            self._required_kill_sc = frozenset()
+            self._groups = []
+            self._kill_groups = []
             self._current_hotkey = None
             self._current_kill = None
-            self._pressed = set()
             self._pressed_sc = set()
             self._latched = False
             self._kill_latched = False
@@ -472,3 +618,11 @@ class HotkeyManager:
     @property
     def current_kill(self):
         return self._current_kill
+
+    @property
+    def main_groups(self):
+        return [sorted(g) for g in self._groups]
+
+    @property
+    def kill_groups(self):
+        return [sorted(g) for g in self._kill_groups]

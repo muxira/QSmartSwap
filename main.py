@@ -51,7 +51,8 @@ from steam_locate import find_cs2_root, get_cfg_dir
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 ICON_PATH = os.path.join(BASE_DIR, "icon.png")
-CONFIG_JSON = os.path.join(BASE_DIR, "config.json")
+# QSMARTSWAP_CONFIG override exists so tests never touch the real config.json
+CONFIG_JSON = os.environ.get("QSMARTSWAP_CONFIG", os.path.join(BASE_DIR, "config.json"))
 DEFAULT_PORT = 7777
 DEFAULT_HOTKEY = "q"
 DEFAULT_KILL_HOTKEY = "ctrl+end"
@@ -77,6 +78,20 @@ def save_settings(data: dict):
         pass
 
 
+def _clean_codes(groups):
+    """Sanitize stored scan-code groups: [[29],[16]] or None. Garbage -> None."""
+    if not isinstance(groups, list) or not groups:
+        return None
+    out = []
+    for g in groups:
+        items = g if isinstance(g, list) else [g]
+        ints = [c for c in items if isinstance(c, int) and 0 <= c <= 0xFFFFFF]
+        if not ints:
+            return None
+        out.append(ints)
+    return out
+
+
 class MainWindow(QMainWindow):
     log_signal = pyqtSignal(str)
     hotkey_captured = pyqtSignal(str)
@@ -96,6 +111,10 @@ class MainWindow(QMainWindow):
         self.hotkey_mgr = HotkeyManager(self.state, self._log, kill_callback=self._emit_quit)
         self._capturing = False
         self._capture_target = "main"
+        self._captured_codes = None
+        # exact scan-code groups from capture (None = legacy string bind)
+        self._main_codes = _clean_codes(self.settings.get("hotkey_sc"))
+        self._kill_codes = _clean_codes(self.settings.get("kill_sc"))
         self.rule_rows: list[dict] = []  # {active: QComboBox, target: QComboBox}
         self.slot_edits: dict[str, QLineEdit] = {}
         # guard: while UI is being built the fields are still empty —
@@ -116,7 +135,7 @@ class MainWindow(QMainWindow):
         kill_hotkey = self.settings.get("kill_hotkey") or DEFAULT_KILL_HOTKEY
         self.hotkey_edit.setText(hotkey)
         self.kill_edit.setText(kill_hotkey)
-        self.hotkey_mgr.start(hotkey, kill_hotkey)
+        self.hotkey_mgr.start(hotkey, kill_hotkey, self._main_codes, self._kill_codes)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh_status)
@@ -377,6 +396,8 @@ class MainWindow(QMainWindow):
         return {
             "hotkey": self.hotkey_edit.text().strip(),
             "kill_hotkey": self.kill_edit.text().strip(),
+            "hotkey_sc": self._main_codes,
+            "kill_sc": self._kill_codes,
             "port": self.spin_port.value(),
             "lang": self.lang,
             "fallback_primary": self.chk_fallback.isChecked(),
@@ -478,6 +499,9 @@ class MainWindow(QMainWindow):
         self._capture_target = target
         self._prev_hotkey = self.hotkey_edit.text().strip()
         self._prev_kill = self.kill_edit.text().strip()
+        self._prev_main_codes = list(self._main_codes or [])
+        self._prev_kill_codes = list(self._kill_codes or [])
+        self._captured_codes = None
         # останавливаем старый хук чтобы он не срабатывал во время захвата
         try:
             self.hotkey_mgr.stop()
@@ -488,12 +512,19 @@ class MainWindow(QMainWindow):
 
         def worker():
             try:
-                import keyboard
+                from hotkey_logic import capture_combo, combo_display
 
-                hk = keyboard.read_hotkey(suppress=False)
-                self.hotkey_captured.emit(hk or "")
+                # scan-code capture: left/right/numpad are distinct binds
+                codes = capture_combo(timeout=30.0)
+                if codes is None:
+                    self._captured_codes = None
+                    self.hotkey_captured.emit("")
+                else:
+                    self._captured_codes = codes
+                    self.hotkey_captured.emit(combo_display(codes))
             except Exception as e:  # noqa: BLE001
                 self.log_signal.emit(f"!! Hotkey capture failed: {e}")
+                self._captured_codes = None
                 self.hotkey_captured.emit("")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -503,18 +534,24 @@ class MainWindow(QMainWindow):
         self.btn_hotkey.setText(self.t("hotkey_change"))
         self.btn_kill.setText(self.t("hotkey_change"))
         hk = (hk or "").strip()
-        if not hk or hk.lower() == "esc":
+        codes = getattr(self, "_captured_codes", None)
+        if not hk or not codes:
             # отмена — возвращаем старые хоткеи
             self.hotkey_mgr.start(
                 getattr(self, "_prev_hotkey", "") or DEFAULT_HOTKEY,
                 getattr(self, "_prev_kill", "") or None,
+                getattr(self, "_prev_main_codes", None) or None,
+                getattr(self, "_prev_kill_codes", None) or None,
             )
             return  # отмена
         if getattr(self, "_capture_target", "main") == "kill":
             self.kill_edit.setText(hk)
+            self._kill_codes = codes
         else:
             self.hotkey_edit.setText(hk)
-        self.hotkey_mgr.start(self.hotkey_edit.text().strip(), self.kill_edit.text().strip())
+            self._main_codes = codes
+        self.hotkey_mgr.start(self.hotkey_edit.text().strip(), self.kill_edit.text().strip(),
+                              self._main_codes, self._kill_codes)
         self._persist()
 
     def _emit_quit(self):
