@@ -18,6 +18,13 @@ STRINGS = {
         "rules_then": "Взять",
         "slotkeys_title": "Клавиши слотов (что нажимать в игре):",
         "slotkeys_reset": "Сбросить",
+        "slotkeys_write": "Забиндить слоты (.cfg)",
+        "binds_title": "Бинды записаны",
+        "binds_text": (
+            "Файл биндов записан:\n{path}\n{warnings}\n"
+            "Применение в консоли игры:\n  exec qsmartswap_binds\n"
+            "(.cfg лежит рядом с gamestate_integration_*.cfg)"
+        ),
         "console_label": "Вывод:",
         "install_cfg": "Установить GSI-конфиг",
         "minimize_tray": "Свернуть в трей",
@@ -55,6 +62,12 @@ STRINGS = {
         "rules_then": "Take",
         "slotkeys_title": "Slot keys (what to press in game):",
         "slotkeys_reset": "Reset",
+        "slotkeys_write": "Write slot binds (.cfg)",
+        "binds_title": "Binds written",
+        "binds_text": (
+            "Binds file written:\n{path}\n{warnings}\n"
+            "Apply in game console:\n  exec qsmartswap_binds"
+        ),
         "console_label": "Output:",
         "install_cfg": "Install GSI config",
         "minimize_tray": "Minimize to tray",

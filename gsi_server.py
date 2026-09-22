@@ -27,7 +27,7 @@ LOGICAL_SLOTS: dict[str, dict] = {
     "primary": {"valve": "slot1", "default_key": "1", "label": "Основное (slot1)"},
     "secondary": {"valve": "slot2", "default_key": "2", "label": "Вторичное (slot2)"},
     "knife": {"valve": "slot3", "default_key": "3", "label": "Нож (slot3)"},
-    "zeus": {"valve": "slot11", "default_key": "3", "label": "Zeus (slot11 / slot3)"},
+    "zeus": {"valve": "slot11", "default_key": "", "label": "Zeus (slot11 / slot3)"},
     "grenades": {"valve": "slot4", "default_key": "4", "label": "Гранаты, цикл (slot4)"},
     "hegrenade": {"valve": "slot6", "default_key": "6", "label": "HE (slot6)"},
     "flashbang": {"valve": "slot7", "default_key": "7", "label": "Флэш (slot7)"},
@@ -40,6 +40,11 @@ LOGICAL_SLOTS: dict[str, dict] = {
 }
 
 SLOT_IDS = list(LOGICAL_SLOTS.keys())
+VALVE_MAP = {slot: LOGICAL_SLOTS[slot]["valve"] for slot in SLOT_IDS}
+
+# Фазы раунда, в которых свап разрешён (оружие реально в руках).
+# "over" (конец раунда) и неизвестные фазы — функции выключены.
+ARMED_ROUND_PHASES = {"warmup", "freezetime", "live"}
 
 
 def weapon_to_slot(wname: str, wtype: str) -> str:
@@ -89,10 +94,18 @@ class GsiState:
         self.connected = False
         self.last_update = 0.0
         self.last_raw_summary = ""
+        self.round_phase: str | None = None
+        self.round_seen = False
 
     def update_from_payload(self, data: dict) -> dict:
         """Разбирает GSI-пакет. Возвращает новый снапшот."""
         weapons = data.get("player", {}).get("weapons", {}) or {}
+        round_info = data.get("round") or {}
+        phase = round_info.get("phase")
+        if isinstance(phase, str):
+            phase = phase.lower()
+        else:
+            phase = None
 
         owned: set[str] = set()
         found_active: str | None = None
@@ -115,6 +128,9 @@ class GsiState:
             summary_lines.append(f"{wname} [{wtype}] state={wstate}")
 
         with self._lock:
+            if phase is not None:
+                self.round_phase = phase
+                self.round_seen = True
             # пустой пакет (смерть/спектатор/меню) — инвентарь не затираем,
             # иначе правила будут думать что оружия нет
             if weapons:
@@ -130,6 +146,11 @@ class GsiState:
 
     def _snapshot_locked(self) -> dict:
         owned = set(self.owned)
+        armed = (
+            self.connected
+            and self.round_seen
+            and (self.round_phase in ARMED_ROUND_PHASES)
+        )
         return {
             "active_slot": self.active_slot,
             "owned": sorted(owned),
@@ -137,6 +158,9 @@ class GsiState:
             "has_secondary": "secondary" in owned,
             "has_knife": "knife" in owned,
             "connected": self.connected,
+            "round_phase": self.round_phase,
+            "round_seen": self.round_seen,
+            "armed": armed,
             "last_update": self.last_update,
             "summary": self.last_raw_summary,
         }
@@ -170,9 +194,14 @@ def _make_handler(state: GsiState, log_callback, expected_path: str):
             old = state.snapshot()
             new = state.update_from_payload(data)
             # логируем только изменения, иначе при throttle 0.1 будет спам 10 строк/сек
-            if (new["active_slot"] != old["active_slot"]) or (new["owned"] != old["owned"]):
+            if (
+                (new["active_slot"] != old["active_slot"])
+                or (new["owned"] != old["owned"])
+                or (new["round_phase"] != old["round_phase"])
+            ):
                 log_callback(
-                    f"active={new['active_slot']} owned={','.join(new['owned']) or '-'}"
+                    f"active={new['active_slot']} owned={','.join(new['owned']) or '-'} "
+                    f"round={new['round_phase']}"
                 )
 
     return Handler

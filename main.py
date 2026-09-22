@@ -34,8 +34,8 @@ from PyQt6.QtWidgets import (
     QMenu,
 )
 
-from gsi_config import GSI_PATH, install_config
-from gsi_server import LOGICAL_SLOTS, SLOT_IDS, GsiServerThread, GsiState
+from gsi_config import GSI_PATH, install_binds, install_config, is_config_installed
+from gsi_server import LOGICAL_SLOTS, SLOT_IDS, VALVE_MAP, GsiServerThread, GsiState
 from hotkey_logic import DEFAULT_RULES, SLOT_KEYS_DEFAULT, HotkeyManager
 from i18n import STRINGS, slot_label
 from steam_locate import find_cs2_root, get_cfg_dir
@@ -103,6 +103,10 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh_status)
         self.timer.start(500)
+
+        # первый запуск: если GSI-конфига нет — ставим сами и показываем
+        # попап про перезапуск игры (иначе round.phase не прилетит никогда)
+        QTimer.singleShot(600, self._first_run_check)
 
     # --- UI ---
 
@@ -190,7 +194,12 @@ class MainWindow(QMainWindow):
             self.slots_grid.addWidget(edit, i // 3, (i % 3) * 2 + 1)
         self.btn_slots_reset = QPushButton()
         self.btn_slots_reset.clicked.connect(self._reset_slot_keys)
-        slots_outer.addWidget(self.btn_slots_reset)
+        self.btn_slots_write = QPushButton()
+        self.btn_slots_write.clicked.connect(self._write_binds)
+        row_slots_btns = QHBoxLayout()
+        row_slots_btns.addWidget(self.btn_slots_reset)
+        row_slots_btns.addWidget(self.btn_slots_write)
+        slots_outer.addLayout(row_slots_btns)
         main.addWidget(self.grp_slots)
 
         # консоль
@@ -252,6 +261,7 @@ class MainWindow(QMainWindow):
         self.btn_add_rule.setText(self.t("rules_add"))
         self.grp_slots.setTitle(self.t("slotkeys_title"))
         self.btn_slots_reset.setText(self.t("slotkeys_reset"))
+        self.btn_slots_write.setText(self.t("slotkeys_write"))
         self.lbl_console.setText(self.t("console_label"))
         self.btn_install.setText(self.t("install_cfg"))
         self.lbl_lang.setText(self.t("lang_label"))
@@ -371,6 +381,12 @@ class MainWindow(QMainWindow):
         if self._capturing:
             return
         self._capturing = True
+        self._prev_hotkey = self.hotkey_edit.text().strip()
+        # останавливаем старый хук чтобы он не срабатывал во время захвата
+        try:
+            self.hotkey_mgr.stop()
+        except Exception:  # noqa: BLE001
+            pass
         self.btn_hotkey.setText(self.t("hotkey_capture"))
 
         def worker():
@@ -390,6 +406,9 @@ class MainWindow(QMainWindow):
         self.btn_hotkey.setText(self.t("hotkey_change"))
         hk = (hk or "").strip()
         if not hk or hk.lower() == "esc":
+            # отмена — возвращаем старый хоткей
+            if getattr(self, "_prev_hotkey", ""):
+                self.hotkey_mgr.start(self._prev_hotkey)
             return  # отмена
         self.hotkey_edit.setText(hk)
         self.hotkey_mgr.start(hk)
@@ -445,6 +464,59 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, self.t("popup_title"), self.t("popup_text").format(path=target))
         self._log(f"GSI-конфиг записан: {target} (порт {port})")
 
+    def _first_run_check(self):
+        """При первом запуске: авто-установка GSI + попап про перезапуск игры."""
+        if self.settings.get("cfg_autoinstalled"):
+            return
+        try:
+            cs2_root = find_cs2_root()
+        except Exception:  # noqa: BLE001
+            cs2_root = None
+        if not cs2_root:
+            self._log("Первый запуск: CS2 не найден — поставь GSI-конфиг кнопкой позже")
+            return
+        try:
+            cfg_dir = get_cfg_dir(cs2_root)
+            if is_config_installed(cfg_dir):
+                # конфиг уже есть, но мог быть старого формата без round —
+                # перезаписываем под актуальный порт чтобы round.phase точно летел
+                target = install_config(cfg_dir, self.spin_port.value(), GSI_PATH)
+            else:
+                target = install_config(cfg_dir, self.spin_port.value(), GSI_PATH)
+        except OSError as e:
+            self._log(f"Первый запуск: не смог записать GSI-конфиг: {e}")
+            return
+        self.settings["cfg_autoinstalled"] = True
+        self._persist()
+        QMessageBox.information(self, self.t("popup_title"), self.t("popup_text").format(path=target))
+        self._log(f"GSI-конфиг записан: {target} (порт {self.spin_port.value()})")
+
+    def _write_binds(self):
+        """Кнопка 'Забиндить слоты': пишет qsmartswap_binds.cfg в cfg CS2."""
+        slot_keys = {s: e.text().strip() for s, e in self.slot_edits.items()}
+        cs2_root = find_cs2_root()
+        if not cs2_root:
+            QMessageBox.warning(self, "QSmartSwap", self.t("err_no_steam"))
+            chosen = QFileDialog.getExistingDirectory(self, self.t("choose_cs2_folder"), os.path.expanduser("~"))
+            if not chosen:
+                return
+            cs2_root = chosen
+        try:
+            cfg_dir = get_cfg_dir(cs2_root)
+            from gsi_config import BINDS_FILENAME  # noqa: F401  (для читаемости пути в логе)
+
+            target, warnings = install_binds(cfg_dir, slot_keys, VALVE_MAP)
+        except OSError as e:
+            QMessageBox.critical(self, "QSmartSwap", str(e))
+            return
+        warn_text = ("\n" + "\n".join(f"! {w}" for w in warnings)) if warnings else ""
+        QMessageBox.information(
+            self, self.t("binds_title"), self.t("binds_text").format(path=target, warnings=warn_text)
+        )
+        self._log(f"Бинды записаны: {target}")
+        for w in warnings:
+            self._log(f"! {w}")
+
     # --- лог/статус ---
 
     def _log(self, msg: str):
@@ -462,11 +534,13 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_server_status.setText(self.t("status_server_off"))
         snap = self.state.snapshot()
+        phase = snap.get("round_phase") or "-"
         if snap["connected"] and snap["active_slot"]:
             owned = ",".join(snap["owned"]) or "-"
-            self.lbl_gsi_status.setText(self.t("status_gsi_ok").format(active=snap["active_slot"], owned=owned))
+            base = self.t("status_gsi_ok").format(active=snap["active_slot"], owned=owned)
+            self.lbl_gsi_status.setText(f"{base} | round={phase}")
         else:
-            self.lbl_gsi_status.setText(self.t("status_gsi_wait"))
+            self.lbl_gsi_status.setText(f"{self.t('status_gsi_wait')} (round={phase})")
 
     # --- язык/трей/выход ---
 
@@ -477,7 +551,7 @@ class MainWindow(QMainWindow):
         self._persist()
 
     def _hide_to_tray(self):
-        if not self.tray.isAvailable():
+        if not QSystemTrayIcon.isSystemTrayAvailable():
             QMessageBox.warning(self, "QSmartSwap", "Tray недоступен")
             return
         self.tray.show()
