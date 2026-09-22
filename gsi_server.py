@@ -42,9 +42,9 @@ LOGICAL_SLOTS: dict[str, dict] = {
 SLOT_IDS = list(LOGICAL_SLOTS.keys())
 VALVE_MAP = {slot: LOGICAL_SLOTS[slot]["valve"] for slot in SLOT_IDS}
 
-# Фазы раунда, в которых свап разрешён (оружие реально в руках).
-# "over" (конец раунда) и неизвестные фазы — функции выключены.
-ARMED_ROUND_PHASES = {"warmup", "freezetime", "live"}
+# Round phases where swapping is allowed (weapon actually in hands,
+# including "over" so binds keep working between rounds).
+ARMED_ROUND_PHASES = {"warmup", "freezetime", "live", "over"}
 
 
 def weapon_to_slot(wname: str, wtype: str) -> str:
@@ -188,7 +188,7 @@ def _make_handler(state: GsiState, log_callback, expected_path: str):
             try:
                 data = json.loads(raw.decode("utf-8"))
             except (json.JSONDecodeError, UnicodeDecodeError):
-                log_callback("!! Получен невалидный JSON от игры")
+                log_callback("!! Invalid JSON from game")
                 return
 
             old = state.snapshot()
@@ -221,9 +221,9 @@ class GsiServerThread(threading.Thread):
         try:
             self._server = HTTPServer(("127.0.0.1", self.port), handler_cls)
         except OSError as e:
-            self.log_callback(f"!! Не удалось запустить сервер на порту {self.port}: {e}")
+            self.log_callback(f"!! Failed to start server on port {self.port}: {e}")
             return
-        self.log_callback(f"GSI-сервер слушает http://127.0.0.1:{self.port}{self.path}")
+        self.log_callback(f"GSI server listening on http://127.0.0.1:{self.port}{self.path}")
         try:
             self._server.serve_forever()
         except Exception:  # noqa: BLE001

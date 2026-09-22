@@ -16,14 +16,15 @@ STRINGS = {
         "rules_add": "+ Добавить",
         "rules_if": "Если активен",
         "rules_then": "Взять",
+        "viceversa": "Viceversa: пистолет = основное, пока нет primary",
         "slotkeys_title": "Клавиши слотов (что нажимать в игре):",
         "slotkeys_reset": "Сбросить",
         "slotkeys_write": "Забиндить слоты (.cfg)",
         "binds_title": "Бинды записаны",
         "binds_text": (
-            "Файл биндов записан:\n{path}\n{warnings}\n"
-            "Применение в консоли игры:\n  exec qsmartswap_binds\n"
-            "(.cfg лежит рядом с gamestate_integration_*.cfg)"
+            "Файл биндов записан:\n{path}\n"
+            "Автозагрузка: {autoexec}\n{warnings}\n"
+            "Игра подхватит бинды сама при запуске."
         ),
         "console_label": "Вывод:",
         "install_cfg": "Установить GSI-конфиг",
@@ -60,13 +61,15 @@ STRINGS = {
         "rules_add": "+ Add",
         "rules_if": "If active",
         "rules_then": "Take",
+        "viceversa": "Viceversa: pistol = primary while no primary owned",
         "slotkeys_title": "Slot keys (what to press in game):",
         "slotkeys_reset": "Reset",
         "slotkeys_write": "Write slot binds (.cfg)",
         "binds_title": "Binds written",
         "binds_text": (
-            "Binds file written:\n{path}\n{warnings}\n"
-            "Apply in game console:\n  exec qsmartswap_binds"
+            "Binds file written:\n{path}\n"
+            "Autoload: {autoexec}\n{warnings}\n"
+            "The game picks up binds automatically on start."
         ),
         "console_label": "Output:",
         "install_cfg": "Install GSI config",

@@ -16,6 +16,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 from PyQt6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QFileDialog,
     QGridLayout,
@@ -34,7 +35,15 @@ from PyQt6.QtWidgets import (
     QMenu,
 )
 
-from gsi_config import GSI_PATH, install_binds, install_config, is_config_installed
+from gsi_config import (
+    GSI_PATH,
+    build_cfg_content,
+    install_binds,
+    install_config,
+    is_config_installed,
+    read_config_text,
+    remove_legacy_configs,
+)
 from gsi_server import LOGICAL_SLOTS, SLOT_IDS, VALVE_MAP, GsiServerThread, GsiState
 from hotkey_logic import DEFAULT_RULES, SLOT_KEYS_DEFAULT, HotkeyManager
 from i18n import STRINGS, slot_label
@@ -175,6 +184,10 @@ class MainWindow(QMainWindow):
         self.btn_add_rule = QPushButton()
         self.btn_add_rule.clicked.connect(lambda: self.add_rule_row())
         rules_layout.addWidget(self.btn_add_rule)
+        self.chk_viceversa = QCheckBox()
+        self.chk_viceversa.setChecked(self.settings.get("viceversa", True))
+        self.chk_viceversa.stateChanged.connect(self._on_viceversa_changed)
+        rules_layout.addWidget(self.chk_viceversa)
         main.addWidget(self.grp_rules)
 
         # клавиши слотов
@@ -259,6 +272,7 @@ class MainWindow(QMainWindow):
         self.lbl_rule_if.setText(self.t("rules_if"))
         self.lbl_rule_then.setText(self.t("rules_then"))
         self.btn_add_rule.setText(self.t("rules_add"))
+        self.chk_viceversa.setText(self.t("viceversa"))
         self.grp_slots.setTitle(self.t("slotkeys_title"))
         self.btn_slots_reset.setText(self.t("slotkeys_reset"))
         self.btn_slots_write.setText(self.t("slotkeys_write"))
@@ -291,6 +305,7 @@ class MainWindow(QMainWindow):
         rules = self.settings.get("rules")
         if isinstance(rules, list) and rules:
             self.hotkey_mgr.set_rules(rules)
+        self.hotkey_mgr.viceversa = bool(self.settings.get("viceversa", True))
         slot_keys = self.settings.get("slot_keys") or {}
         for slot in SLOT_IDS:
             val = slot_keys.get(slot, SLOT_KEYS_DEFAULT.get(slot, ""))
@@ -303,6 +318,7 @@ class MainWindow(QMainWindow):
             "hotkey": self.hotkey_edit.text().strip(),
             "port": self.spin_port.value(),
             "lang": self.lang,
+            "viceversa": self.chk_viceversa.isChecked(),
             "rules": [
                 {"active": r["active"].currentData(), "target": r["target"].currentData()}
                 for r in self.rule_rows
@@ -311,7 +327,14 @@ class MainWindow(QMainWindow):
         }
 
     def _persist(self):
-        save_settings(self._collect_settings())
+        # merge, not replace — otherwise extra flags (cfg_autoinstalled) are lost
+        self.settings.update(self._collect_settings())
+        save_settings(self.settings)
+
+    def _on_viceversa_changed(self):
+        self.hotkey_mgr.viceversa = self.chk_viceversa.isChecked()
+        self._log(f"Viceversa {'ON' if self.hotkey_mgr.viceversa else 'OFF'}")
+        self._persist()
 
     # --- правила ---
 
@@ -352,7 +375,8 @@ class MainWindow(QMainWindow):
         for r in self.rule_rows:
             a, t = r["active"].currentData(), r["target"].currentData()
             if a == t:
-                self._log(self.t("same_slot_error"))
+                # console output stays English regardless of UI language
+                self._log("Rule slots must differ — target shifted")
                 # сдвигаем target на следующий слот чтобы не было петли
                 idx = (SLOT_IDS.index(t) + 1) % len(SLOT_IDS)
                 r["target"].blockSignals(True)
@@ -396,7 +420,7 @@ class MainWindow(QMainWindow):
                 hk = keyboard.read_hotkey(suppress=False)
                 self.hotkey_captured.emit(hk or "")
             except Exception as e:  # noqa: BLE001
-                self.log_signal.emit(f"!! Захват клавиши не удался: {e}")
+                self.log_signal.emit(f"!! Hotkey capture failed: {e}")
                 self.hotkey_captured.emit("")
 
         threading.Thread(target=worker, daemon=True).start()
@@ -425,10 +449,27 @@ class MainWindow(QMainWindow):
         self.server_port = port
         self.spin_port.setValue(port)
         if not silent:
-            action = "Рестарт" if restart else "Старт"
-            self._log(f"{action} сервера на порту {port}")
+            action = "restarted" if restart else "started"
+            self._log(f"Server {action} on port {port}")
         self._persist()
         self._refresh_status()
+        if not silent:
+            # keep GSI config in sync with the port (no popup — just log)
+            self._sync_cfg_with_port(port)
+
+    def _sync_cfg_with_port(self, port: int):
+        """Silently rewrite GSI config if it differs (e.g. port changed)."""
+        try:
+            cs2_root = find_cs2_root()
+            if not cs2_root:
+                return
+            cfg_dir = get_cfg_dir(cs2_root)
+            expected = build_cfg_content(port, GSI_PATH)
+            if read_config_text(cfg_dir) != expected:
+                target = install_config(cfg_dir, port, GSI_PATH)
+                self._log(f"GSI config updated for port {port}: {target} (restart game if running)")
+        except Exception:  # noqa: BLE001
+            pass
 
     def stop_server(self, silent: bool = False):
         if self.server_thread:
@@ -437,7 +478,7 @@ class MainWindow(QMainWindow):
             self.server_thread = None
             self.server_port = None
             if not silent:
-                self._log("Сервер остановлен")
+                self._log("Server stopped")
         self._refresh_status()
 
     @property
@@ -462,60 +503,73 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "QSmartSwap", str(e))
             return
         QMessageBox.information(self, self.t("popup_title"), self.t("popup_text").format(path=target))
-        self._log(f"GSI-конфиг записан: {target} (порт {port})")
+        self._log(f"GSI config written: {target} (port {port})")
 
     def _first_run_check(self):
-        """При первом запуске: авто-установка GSI + попап про перезапуск игры."""
-        if self.settings.get("cfg_autoinstalled"):
-            return
+        """First launch: install GSI config only if missing/outdated + popup.
+
+        If the file already matches the current port — do nothing, no popup.
+        (The old code rewrote the file and popped up on EVERY launch because
+        _persist() dropped the cfg_autoinstalled flag — fixed as well.)"""
         try:
             cs2_root = find_cs2_root()
         except Exception:  # noqa: BLE001
             cs2_root = None
         if not cs2_root:
-            self._log("Первый запуск: CS2 не найден — поставь GSI-конфиг кнопкой позже")
+            self._log("First run: CS2 not found — install GSI config via button later")
             return
         try:
             cfg_dir = get_cfg_dir(cs2_root)
-            if is_config_installed(cfg_dir):
-                # конфиг уже есть, но мог быть старого формата без round —
-                # перезаписываем под актуальный порт чтобы round.phase точно летел
-                target = install_config(cfg_dir, self.spin_port.value(), GSI_PATH)
-            else:
-                target = install_config(cfg_dir, self.spin_port.value(), GSI_PATH)
+            expected = build_cfg_content(self.spin_port.value(), GSI_PATH)
+            current = read_config_text(cfg_dir) if is_config_installed(cfg_dir) else None
+            for stale in remove_legacy_configs(cfg_dir):
+                self._log(f"Removed stale config: {stale}")
+            if current == expected:
+                self.settings["cfg_autoinstalled"] = True
+                self._persist()
+                self._log("GSI config up to date — no action needed")
+                return
+            target = install_config(cfg_dir, self.spin_port.value(), GSI_PATH)
         except OSError as e:
-            self._log(f"Первый запуск: не смог записать GSI-конфиг: {e}")
+            self._log(f"First run: failed to write GSI config: {e}")
             return
         self.settings["cfg_autoinstalled"] = True
         self._persist()
         QMessageBox.information(self, self.t("popup_title"), self.t("popup_text").format(path=target))
-        self._log(f"GSI-конфиг записан: {target} (порт {self.spin_port.value()})")
+        self._log(f"GSI config written: {target} (port {self.spin_port.value()})")
 
     def _write_binds(self):
-        """Кнопка 'Забиндить слоты': пишет qsmartswap_binds.cfg в cfg CS2."""
-        slot_keys = {s: e.text().strip() for s, e in self.slot_edits.items()}
-        cs2_root = find_cs2_root()
-        if not cs2_root:
-            QMessageBox.warning(self, "QSmartSwap", self.t("err_no_steam"))
-            chosen = QFileDialog.getExistingDirectory(self, self.t("choose_cs2_folder"), os.path.expanduser("~"))
-            if not chosen:
-                return
-            cs2_root = chosen
-        try:
-            cfg_dir = get_cfg_dir(cs2_root)
-            from gsi_config import BINDS_FILENAME  # noqa: F401  (для читаемости пути в логе)
-
-            target, warnings = install_binds(cfg_dir, slot_keys, VALVE_MAP)
-        except OSError as e:
-            QMessageBox.critical(self, "QSmartSwap", str(e))
+        """'Bind slots' button: write qsmartswap_binds.cfg + autoexec hook."""
+        if getattr(self, "_writing_binds", False):
             return
-        warn_text = ("\n" + "\n".join(f"! {w}" for w in warnings)) if warnings else ""
-        QMessageBox.information(
-            self, self.t("binds_title"), self.t("binds_text").format(path=target, warnings=warn_text)
-        )
-        self._log(f"Бинды записаны: {target}")
-        for w in warnings:
-            self._log(f"! {w}")
+        self._writing_binds = True
+        try:
+            slot_keys = {s: e.text().strip() for s, e in self.slot_edits.items()}
+            cs2_root = find_cs2_root()
+            if not cs2_root:
+                QMessageBox.warning(self, "QSmartSwap", self.t("err_no_steam"))
+                chosen = QFileDialog.getExistingDirectory(self, self.t("choose_cs2_folder"), os.path.expanduser("~"))
+                if not chosen:
+                    return
+                cs2_root = chosen
+            try:
+                cfg_dir = get_cfg_dir(cs2_root)
+                target, warnings, autoexec = install_binds(cfg_dir, slot_keys, VALVE_MAP)
+            except OSError as e:
+                QMessageBox.critical(self, "QSmartSwap", str(e))
+                return
+            autoexec_text = autoexec if autoexec else "autoexec.cfg (exec line already present)"
+            warn_text = ("\n" + "\n".join(f"! {w}" for w in warnings)) if warnings else ""
+            QMessageBox.information(
+                self,
+                self.t("binds_title"),
+                self.t("binds_text").format(path=target, autoexec=autoexec_text, warnings=warn_text),
+            )
+            self._log(f"Binds written: {target} | autoload: {autoexec_text}")
+            for w in warnings:
+                self._log(f"! {w}")
+        finally:
+            self._writing_binds = False
 
     # --- лог/статус ---
 
