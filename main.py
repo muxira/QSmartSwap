@@ -95,6 +95,9 @@ class MainWindow(QMainWindow):
         self._capturing = False
         self.rule_rows: list[dict] = []  # {active: QComboBox, target: QComboBox}
         self.slot_edits: dict[str, QLineEdit] = {}
+        # guard: while UI is being built the fields are still empty —
+        # _persist() must not clobber settings with those empties
+        self._loading = True
 
         self._build_ui()
         self._apply_settings_to_logic()
@@ -105,7 +108,7 @@ class MainWindow(QMainWindow):
 
         # автостарт сервера при запуске
         self.start_server(self.settings.get("port", DEFAULT_PORT), silent=False)
-        hotkey = self.settings.get("hotkey", DEFAULT_HOTKEY)
+        hotkey = self.settings.get("hotkey") or DEFAULT_HOTKEY
         self.hotkey_edit.setText(hotkey)
         self.hotkey_mgr.start(hotkey)
 
@@ -116,6 +119,8 @@ class MainWindow(QMainWindow):
         # первый запуск: если GSI-конфига нет — ставим сами и показываем
         # попап про перезапуск игры (иначе round.phase не прилетит никогда)
         QTimer.singleShot(600, self._first_run_check)
+
+        self._loading = False
 
     # --- UI ---
 
@@ -341,7 +346,9 @@ class MainWindow(QMainWindow):
         self.combo_pf.blockSignals(False)
         slot_keys = self.settings.get("slot_keys") or {}
         for slot in SLOT_IDS:
-            val = slot_keys.get(slot, SLOT_KEYS_DEFAULT.get(slot, ""))
+            # `or` (not get-with-default): heals configs wiped by the old
+            # init-order bug, where empty fields overwrote real values
+            val = slot_keys.get(slot) or SLOT_KEYS_DEFAULT.get(slot, "")
             self.hotkey_mgr.set_slot_key(slot, val)
             if slot in self.slot_edits:
                 self.slot_edits[slot].setText(val)
@@ -361,6 +368,8 @@ class MainWindow(QMainWindow):
         }
 
     def _persist(self):
+        if getattr(self, "_loading", False):
+            return  # init not finished — fields are still empty, don't clobber settings
         # merge, not replace — otherwise extra flags (cfg_autoinstalled) are lost
         self.settings.update(self._collect_settings())
         self.settings.pop("viceversa", None)  # legacy flag, migrated
