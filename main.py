@@ -54,6 +54,7 @@ ICON_PATH = os.path.join(BASE_DIR, "icon.png")
 CONFIG_JSON = os.path.join(BASE_DIR, "config.json")
 DEFAULT_PORT = 7777
 DEFAULT_HOTKEY = "q"
+DEFAULT_KILL_HOTKEY = "ctrl+end"
 DEFAULT_LANG = "ru"
 
 
@@ -79,6 +80,7 @@ def save_settings(data: dict):
 class MainWindow(QMainWindow):
     log_signal = pyqtSignal(str)
     hotkey_captured = pyqtSignal(str)
+    quit_signal = pyqtSignal()
 
     def __init__(self):
         super().__init__()
@@ -91,8 +93,9 @@ class MainWindow(QMainWindow):
         self.state = GsiState()
         self.server_thread: GsiServerThread | None = None
         self.server_port: int | None = None
-        self.hotkey_mgr = HotkeyManager(self.state, self._log)
+        self.hotkey_mgr = HotkeyManager(self.state, self._log, kill_callback=self._emit_quit)
         self._capturing = False
+        self._capture_target = "main"
         self.rule_rows: list[dict] = []  # {active: QComboBox, target: QComboBox}
         self.slot_edits: dict[str, QLineEdit] = {}
         # guard: while UI is being built the fields are still empty —
@@ -105,12 +108,15 @@ class MainWindow(QMainWindow):
 
         self.log_signal.connect(self._append_log)
         self.hotkey_captured.connect(self._on_hotkey_captured)
+        self.quit_signal.connect(self._on_kill_hotkey)
 
         # автостарт сервера при запуске
         self.start_server(self.settings.get("port", DEFAULT_PORT), silent=False)
         hotkey = self.settings.get("hotkey") or DEFAULT_HOTKEY
+        kill_hotkey = self.settings.get("kill_hotkey") or DEFAULT_KILL_HOTKEY
         self.hotkey_edit.setText(hotkey)
-        self.hotkey_mgr.start(hotkey)
+        self.kill_edit.setText(kill_hotkey)
+        self.hotkey_mgr.start(hotkey, kill_hotkey)
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._refresh_status)
@@ -140,11 +146,23 @@ class MainWindow(QMainWindow):
         self.hotkey_edit = QLineEdit()
         self.hotkey_edit.setReadOnly(True)
         self.btn_hotkey = QPushButton()
-        self.btn_hotkey.clicked.connect(self._capture_hotkey)
+        self.btn_hotkey.clicked.connect(lambda: self._capture_hotkey("main"))
         row_hotkey.addWidget(self.lbl_hotkey)
         row_hotkey.addWidget(self.hotkey_edit, 1)
         row_hotkey.addWidget(self.btn_hotkey)
         main.addLayout(row_hotkey)
+
+        # килл-бинд: выход из программы
+        row_kill = QHBoxLayout()
+        self.lbl_kill = QLabel()
+        self.kill_edit = QLineEdit()
+        self.kill_edit.setReadOnly(True)
+        self.btn_kill = QPushButton()
+        self.btn_kill.clicked.connect(lambda: self._capture_hotkey("kill"))
+        row_kill.addWidget(self.lbl_kill)
+        row_kill.addWidget(self.kill_edit, 1)
+        row_kill.addWidget(self.btn_kill)
+        main.addLayout(row_kill)
 
         # порт + сервер
         row_port = QHBoxLayout()
@@ -282,6 +300,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(self.t("title"))
         self.lbl_hotkey.setText(self.t("hotkey_label"))
         self.btn_hotkey.setText(self.t("hotkey_change"))
+        self.lbl_kill.setText(self.t("kill_label"))
+        self.btn_kill.setText(self.t("hotkey_change"))
         self.lbl_port.setText(self.t("port_label"))
         self.btn_start.setText(self.t("server_start"))
         self.btn_restart.setText(self.t("server_restart"))
@@ -356,6 +376,7 @@ class MainWindow(QMainWindow):
     def _collect_settings(self) -> dict:
         return {
             "hotkey": self.hotkey_edit.text().strip(),
+            "kill_hotkey": self.kill_edit.text().strip(),
             "port": self.spin_port.value(),
             "lang": self.lang,
             "fallback_primary": self.chk_fallback.isChecked(),
@@ -450,17 +471,20 @@ class MainWindow(QMainWindow):
 
     # --- хоткей ---
 
-    def _capture_hotkey(self):
+    def _capture_hotkey(self, target: str = "main"):
         if self._capturing:
             return
         self._capturing = True
+        self._capture_target = target
         self._prev_hotkey = self.hotkey_edit.text().strip()
+        self._prev_kill = self.kill_edit.text().strip()
         # останавливаем старый хук чтобы он не срабатывал во время захвата
         try:
             self.hotkey_mgr.stop()
         except Exception:  # noqa: BLE001
             pass
-        self.btn_hotkey.setText(self.t("hotkey_capture"))
+        btn = self.btn_kill if target == "kill" else self.btn_hotkey
+        btn.setText(self.t("hotkey_capture"))
 
         def worker():
             try:
@@ -477,15 +501,31 @@ class MainWindow(QMainWindow):
     def _on_hotkey_captured(self, hk: str):
         self._capturing = False
         self.btn_hotkey.setText(self.t("hotkey_change"))
+        self.btn_kill.setText(self.t("hotkey_change"))
         hk = (hk or "").strip()
         if not hk or hk.lower() == "esc":
-            # отмена — возвращаем старый хоткей
-            if getattr(self, "_prev_hotkey", ""):
-                self.hotkey_mgr.start(self._prev_hotkey)
+            # отмена — возвращаем старые хоткеи
+            self.hotkey_mgr.start(
+                getattr(self, "_prev_hotkey", "") or DEFAULT_HOTKEY,
+                getattr(self, "_prev_kill", "") or None,
+            )
             return  # отмена
-        self.hotkey_edit.setText(hk)
-        self.hotkey_mgr.start(hk)
+        if getattr(self, "_capture_target", "main") == "kill":
+            self.kill_edit.setText(hk)
+        else:
+            self.hotkey_edit.setText(hk)
+        self.hotkey_mgr.start(self.hotkey_edit.text().strip(), self.kill_edit.text().strip())
         self._persist()
+
+    def _emit_quit(self):
+        try:
+            self.quit_signal.emit()
+        except RuntimeError:
+            pass
+
+    def _on_kill_hotkey(self):
+        self._log("Kill hotkey pressed — exiting")
+        self.close()
 
     # --- сервер ---
 

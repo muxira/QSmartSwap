@@ -2,6 +2,7 @@ STRINGS = {
     "ru": {
         "title": "QSmartSwap — переключатель оружия CS2",
         "hotkey_label": "Кейбинд (любая клавиша/комбо):",
+        "kill_label": "Кейбинд выхода (убить программу):",
         "hotkey_change": "Изменить...",
         "hotkey_capture": "Нажми клавиши...",
         "port_label": "Порт сервера:",
@@ -51,6 +52,7 @@ STRINGS = {
     "en": {
         "title": "QSmartSwap — CS2 weapon switcher",
         "hotkey_label": "Keybind (any key/combo):",
+        "kill_label": "Kill hotkey (quit app):",
         "hotkey_change": "Change...",
         "hotkey_capture": "Press keys...",
         "port_label": "Server port:",

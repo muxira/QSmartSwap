@@ -157,13 +157,18 @@ class HotkeyManager:
         foreground_fn=None,
         fallback_primary: bool = True,
         pistol_fallback: str = "primary",
+        kill_callback=None,
     ):
         self.state = state
         self.log_callback = log_callback
         self._send_fn = send_fn  # for tests; default is scan-code send
+        self._kill_callback = kill_callback  # fired by the kill combo, focus-independent
         self._current_hotkey: str | None = None
+        self._current_kill: str | None = None
         self._required: frozenset = frozenset()
         self._required_sc: frozenset = frozenset()
+        self._required_kill: frozenset = frozenset()
+        self._required_kill_sc: frozenset = frozenset()
         self.rules: list[dict] = [dict(r) for r in DEFAULT_RULES]
         self.slot_keys: dict[str, str] = dict(SLOT_KEYS_DEFAULT)
         self.debounce_ms = debounce_ms
@@ -176,6 +181,7 @@ class HotkeyManager:
         self._pressed: set[str] = set()
         self._pressed_sc: set[int] = set()
         self._latched = False
+        self._kill_latched = False
         self._last_fire = 0.0
         self._last_quiet_log = 0.0
         # optimistic prediction for spam
@@ -243,11 +249,14 @@ class HotkeyManager:
 
     def _on_key_event(self, event):
         """keyboard.hook callback. Fires with unrelated keys held too:
-        requires required ⊆ pressed, not exact equality. Names OR scan codes."""
+        requires required ⊆ pressed, not exact equality. Names OR scan codes.
+        The kill combo is checked first and ignores the focus gate."""
         name = _norm_name(getattr(event, "name", "") or "")
         sc = getattr(event, "scan_code", None)
         if not name and sc is None:
             return
+        fire_main = False
+        fire_kill = False
         with self._lock:
             if event.event_type == "down":
                 if name:
@@ -261,22 +270,51 @@ class HotkeyManager:
                     self._pressed_sc.discard(sc)
                 if not self._combo_held_locked():
                     self._latched = False
+                if not self._kill_held_locked():
+                    self._kill_latched = False
                 return
 
-            if self._latched or not self._combo_held_locked():
-                return
             # edge: the just-pressed key must belong to the combo
-            name_ok = bool(name) and name in self._required
-            sc_ok = isinstance(sc, int) and sc in self._required_sc
-            if not (name_ok or sc_ok):
-                return
-            self._latched = True
+            name_ok = bool(name)
+            if (
+                self._required_kill
+                and not self._kill_latched
+                and self._kill_held_locked()
+                and ((name_ok and name in self._required_kill)
+                     or (isinstance(sc, int) and sc in self._required_kill_sc))
+            ):
+                self._kill_latched = True
+                fire_kill = True
+
+            if (
+                self._required
+                and not self._latched
+                and self._combo_held_locked()
+                and ((name_ok and name in self._required)
+                     or (isinstance(sc, int) and sc in self._required_sc))
+            ):
+                self._latched = True
+                fire_main = True
+
+        if fire_kill and self._kill_callback is not None:
+            try:
+                self._kill_callback()
+            except Exception:  # noqa: BLE001
+                pass
+        if fire_main:
             self._on_hotkey()
 
     def _combo_held_locked(self) -> bool:
         if self._required and self._required.issubset(self._pressed):
             return True
         if self._required_sc and self._required_sc.issubset(self._pressed_sc):
+            return True
+        return False
+
+    def _kill_held_locked(self) -> bool:
+        if self._required_kill and self._required_kill.issubset(self._pressed):
+            return True
+        if self._required_kill_sc and self._required_kill_sc.issubset(self._pressed_sc):
             return True
         return False
 
@@ -365,29 +403,42 @@ class HotkeyManager:
         self._predicted_at = time.time()
         self.log_callback(f"[hotkey] {active} -> {target} ('{key_to_send}'){fb_note}{owned_note}")
 
-    def start(self, hotkey: str):
+    def start(self, hotkey: str, kill_hotkey: str | None = None):
         self.stop()
         required = parse_combo(hotkey)
         if not required:
             self.log_callback("!! Empty hotkey")
             return False
+        required_kill = parse_combo(kill_hotkey) if (kill_hotkey or "").strip() else frozenset()
+        if required_kill and required_kill == required:
+            self.log_callback("!! Kill hotkey equals main hotkey — kill disabled")
+            required_kill = frozenset()
         try:
             import keyboard
 
-            sc = set()
-            for p in required:
-                code = _name_to_scancode(p)
-                if code is not None:
-                    sc.add(code)
+            def resolve(combo: frozenset) -> frozenset:
+                sc = set()
+                for p in combo:
+                    code = _name_to_scancode(p)
+                    if code is not None:
+                        sc.add(code)
+                return frozenset(sc)
+
             with self._lock:
                 self._pressed = set()
                 self._pressed_sc = set()
                 self._latched = False
+                self._kill_latched = False
                 self._required = required
-                self._required_sc = frozenset(sc)
+                self._required_sc = resolve(required)
+                self._required_kill = required_kill
+                self._required_kill_sc = resolve(required_kill)
                 self._current_hotkey = hotkey.strip()
+                self._current_kill = (kill_hotkey or "").strip() if required_kill else None
                 self._hook = keyboard.hook(self._on_key_event, suppress=False)
             self.log_callback(f"Listening hotkey: {self._current_hotkey}")
+            if self._current_kill:
+                self.log_callback(f"Listening kill hotkey: {self._current_kill}")
             return True
         except Exception as e:  # noqa: BLE001
             self.log_callback(f"!! Failed to bind '{hotkey}': {e}")
@@ -398,10 +449,14 @@ class HotkeyManager:
             hook, self._hook = self._hook, None
             self._required = frozenset()
             self._required_sc = frozenset()
+            self._required_kill = frozenset()
+            self._required_kill_sc = frozenset()
             self._current_hotkey = None
+            self._current_kill = None
             self._pressed = set()
             self._pressed_sc = set()
             self._latched = False
+            self._kill_latched = False
         if hook is not None:
             try:
                 import keyboard
@@ -413,3 +468,7 @@ class HotkeyManager:
     @property
     def current_hotkey(self):
         return self._current_hotkey
+
+    @property
+    def current_kill(self):
+        return self._current_kill
