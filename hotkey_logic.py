@@ -17,8 +17,10 @@ Anti-spam: optimistic prediction — after firing we assume the target slot
 is active until the game confirms (GSI runs at ~10 Hz). Fast doubles
 alternate correctly instead of reading a stale active slot.
 
-Viceversa mode (toggleable): while no primary is owned, secondary is
-treated as primary and vice versa — until a primary is picked up.
+Missing-weapon fallback (configurable): if the rule target is not owned,
+primary falls back to secondary, and secondary falls back to primary/knife
+(user choice) — only if the replacement is actually owned. Matching always
+uses the real active slot, so one press = one predictable outcome.
 
 Keycodes, not layout: matching and sending is done by scan code whenever
 possible, so binds work in any keyboard layout (q == й). Rule matching
@@ -153,7 +155,8 @@ class HotkeyManager:
         debounce_ms: int = 35,
         focus_check: bool = True,
         foreground_fn=None,
-        viceversa: bool = True,
+        fallback_primary: bool = True,
+        pistol_fallback: str = "primary",
     ):
         self.state = state
         self.log_callback = log_callback
@@ -165,7 +168,8 @@ class HotkeyManager:
         self.slot_keys: dict[str, str] = dict(SLOT_KEYS_DEFAULT)
         self.debounce_ms = debounce_ms
         self.focus_check = focus_check
-        self.viceversa = viceversa
+        self.fallback_primary = fallback_primary
+        self.pistol_fallback = pistol_fallback  # "primary" | "knife" | "nothing"
         self._foreground_fn = foreground_fn or _foreground_process_name
         self._hook = None
         self._lock = threading.Lock()
@@ -316,17 +320,12 @@ class HotkeyManager:
             return
 
         owned = snap.get("owned", [])
-        # viceversa: no primary owned -> secondary IS the primary for now
-        alias: dict[str, str] = {}
-        if self.viceversa and "primary" not in owned:
-            alias = {"primary": "secondary", "secondary": "primary"}
 
         active = self._effective_active(snap["active_slot"])
-        lookup_active = alias.get(active, active)
 
         target = None
         for r in self.rules:
-            if r["active"] == lookup_active:
+            if r["active"] == active:
                 target = r["target"]
                 break
 
@@ -334,13 +333,26 @@ class HotkeyManager:
             self.log_callback(f"[hotkey] active={active}: no rule — doing nothing")
             return
 
-        real_target = alias.get(target, target)
+        # missing-weapon fallback: redirect the TARGET, never the matching.
+        # Matching always uses the real active slot, so one press = one
+        # predictable outcome (no double-clicking).
+        real_target = target
+        fb_note = ""
+        if target == "primary" and "primary" not in owned:
+            if self.fallback_primary and "secondary" in owned:
+                real_target = "secondary"
+                fb_note = " [fallback: no primary]"
+        elif target == "secondary" and "secondary" not in owned:
+            repl = self.pistol_fallback
+            if repl in ("primary", "knife") and repl in owned:
+                real_target = repl
+                fb_note = " [fallback: no pistol]"
+
         key_to_send = (self.slot_keys.get(real_target) or "").strip()
         if not key_to_send:
             self.log_callback(f"[hotkey] active={active} -> {target}: no slot key set!")
             return
 
-        vice_note = " [viceversa]" if alias else ""
         owned_note = "" if real_target in owned else " (not in inventory?)"
         try:
             self._send(key_to_send)
@@ -351,7 +363,7 @@ class HotkeyManager:
         self._predicted = real_target
         self._predicted_base = snap["active_slot"]
         self._predicted_at = time.time()
-        self.log_callback(f"[hotkey] {active} -> {target} ('{key_to_send}'){vice_note}{owned_note}")
+        self.log_callback(f"[hotkey] {active} -> {target} ('{key_to_send}'){fb_note}{owned_note}")
 
     def start(self, hotkey: str):
         self.stop()

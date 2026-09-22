@@ -184,10 +184,23 @@ class MainWindow(QMainWindow):
         self.btn_add_rule = QPushButton()
         self.btn_add_rule.clicked.connect(lambda: self.add_rule_row())
         rules_layout.addWidget(self.btn_add_rule)
-        self.chk_viceversa = QCheckBox()
-        self.chk_viceversa.setChecked(self.settings.get("viceversa", True))
-        self.chk_viceversa.stateChanged.connect(self._on_viceversa_changed)
-        rules_layout.addWidget(self.chk_viceversa)
+        self.chk_fallback = QCheckBox()
+        self.chk_fallback.setChecked(self.settings.get("fallback_primary", True))
+        self.chk_fallback.stateChanged.connect(self._on_fallback_changed)
+        rules_layout.addWidget(self.chk_fallback)
+        row_pf = QHBoxLayout()
+        self.lbl_pf = QLabel()
+        self.combo_pf = QComboBox()
+        self.combo_pf.addItem("", "primary")
+        self.combo_pf.addItem("", "knife")
+        self.combo_pf.addItem("", "nothing")
+        pf_val = self.settings.get("pistol_fallback", "primary")
+        idx = self.combo_pf.findData(pf_val)
+        self.combo_pf.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_pf.currentIndexChanged.connect(self._on_pistol_fallback_changed)
+        row_pf.addWidget(self.lbl_pf)
+        row_pf.addWidget(self.combo_pf, 1)
+        rules_layout.addLayout(row_pf)
         main.addWidget(self.grp_rules)
 
         # клавиши слотов
@@ -272,7 +285,13 @@ class MainWindow(QMainWindow):
         self.lbl_rule_if.setText(self.t("rules_if"))
         self.lbl_rule_then.setText(self.t("rules_then"))
         self.btn_add_rule.setText(self.t("rules_add"))
-        self.chk_viceversa.setText(self.t("viceversa"))
+        self.chk_fallback.setText(self.t("fallback_primary"))
+        self.lbl_pf.setText(self.t("pistol_fallback_label"))
+        for idx in range(self.combo_pf.count()):
+            data = self.combo_pf.itemData(idx)
+            strkey = {"primary": "pf_primary", "knife": "pf_knife", "nothing": "pf_nothing"}.get(data, "")
+            if strkey:
+                self.combo_pf.setItemText(idx, self.t(strkey))
         self.grp_slots.setTitle(self.t("slotkeys_title"))
         self.btn_slots_reset.setText(self.t("slotkeys_reset"))
         self.btn_slots_write.setText(self.t("slotkeys_write"))
@@ -305,7 +324,21 @@ class MainWindow(QMainWindow):
         rules = self.settings.get("rules")
         if isinstance(rules, list) and rules:
             self.hotkey_mgr.set_rules(rules)
-        self.hotkey_mgr.viceversa = bool(self.settings.get("viceversa", True))
+        # migration from the old viceversa flag
+        if "viceversa" in self.settings and "fallback_primary" not in self.settings:
+            vv = bool(self.settings["viceversa"])
+            self.settings["fallback_primary"] = vv
+            if "pistol_fallback" not in self.settings:
+                self.settings["pistol_fallback"] = "primary" if vv else "nothing"
+        self.hotkey_mgr.fallback_primary = bool(self.settings.get("fallback_primary", True))
+        self.hotkey_mgr.pistol_fallback = self.settings.get("pistol_fallback", "primary")
+        self.chk_fallback.blockSignals(True)
+        self.chk_fallback.setChecked(self.hotkey_mgr.fallback_primary)
+        self.chk_fallback.blockSignals(False)
+        idx = self.combo_pf.findData(self.hotkey_mgr.pistol_fallback)
+        self.combo_pf.blockSignals(True)
+        self.combo_pf.setCurrentIndex(idx if idx >= 0 else 0)
+        self.combo_pf.blockSignals(False)
         slot_keys = self.settings.get("slot_keys") or {}
         for slot in SLOT_IDS:
             val = slot_keys.get(slot, SLOT_KEYS_DEFAULT.get(slot, ""))
@@ -318,7 +351,8 @@ class MainWindow(QMainWindow):
             "hotkey": self.hotkey_edit.text().strip(),
             "port": self.spin_port.value(),
             "lang": self.lang,
-            "viceversa": self.chk_viceversa.isChecked(),
+            "fallback_primary": self.chk_fallback.isChecked(),
+            "pistol_fallback": self.combo_pf.currentData() or "nothing",
             "rules": [
                 {"active": r["active"].currentData(), "target": r["target"].currentData()}
                 for r in self.rule_rows
@@ -329,11 +363,17 @@ class MainWindow(QMainWindow):
     def _persist(self):
         # merge, not replace — otherwise extra flags (cfg_autoinstalled) are lost
         self.settings.update(self._collect_settings())
+        self.settings.pop("viceversa", None)  # legacy flag, migrated
         save_settings(self.settings)
 
-    def _on_viceversa_changed(self):
-        self.hotkey_mgr.viceversa = self.chk_viceversa.isChecked()
-        self._log(f"Viceversa {'ON' if self.hotkey_mgr.viceversa else 'OFF'}")
+    def _on_fallback_changed(self):
+        self.hotkey_mgr.fallback_primary = self.chk_fallback.isChecked()
+        self._log(f"Fallback primary->secondary {'ON' if self.hotkey_mgr.fallback_primary else 'OFF'}")
+        self._persist()
+
+    def _on_pistol_fallback_changed(self):
+        self.hotkey_mgr.pistol_fallback = self.combo_pf.currentData() or "nothing"
+        self._log(f"Pistol fallback: {self.hotkey_mgr.pistol_fallback}")
         self._persist()
 
     # --- правила ---
