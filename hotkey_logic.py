@@ -193,9 +193,30 @@ class HotkeyManager:
                 ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
             ]
 
+        class MOUSEINPUT(ctypes.Structure):
+            _fields_ = [
+                ("dx", wintypes.LONG),
+                ("dy", wintypes.LONG),
+                ("mouseData", wintypes.DWORD),
+                ("dwFlags", wintypes.DWORD),
+                ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.POINTER(ctypes.c_ulong)),
+            ]
+
+        class HARDWAREINPUT(ctypes.Structure):
+            _fields_ = [
+                ("uMsg", wintypes.DWORD),
+                ("wParamL", wintypes.WORD),
+                ("wParamH", wintypes.WORD),
+            ]
+
         class INPUT(ctypes.Structure):
             class _INPUT(ctypes.Union):
-                _fields_ = [("ki", KEYBDINPUT)]
+                _fields_ = [
+                    ("ki", KEYBDINPUT),
+                    ("mi", MOUSEINPUT),
+                    ("hi", HARDWAREINPUT),
+                ]
             _fields_ = [("type", wintypes.DWORD), ("_input", _INPUT)]
 
         flags = KEYEVENTF_SCANCODE
