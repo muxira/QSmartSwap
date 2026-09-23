@@ -1,153 +1,134 @@
-# QSmartSwap
+<div align="center">
+  <img src="icon.ico" width="128" height="128" alt="QSmartSwap Logo">
+  
+  # QSmartSwap
 
-A smart weapon-switch helper for Counter-Strike 2. Press **one** hotkey and the app
-picks the right weapon for you, based on what you are currently holding.
+  **A smart, rule-based weapon-switch assistant for Counter-Strike 2.**
+  
+  [![Platform: Windows](https://img.shields.io/badge/Platform-Windows%2010%20%7C%2011-blue?logo=windows)](#requirements)
+  [![Python](https://img.shields.io/badge/Python-3.10+-yellow?logo=python)](#requirements)
+  [![License](https://img.shields.io/badge/License-MIT-green)](#fair-play-note)
+</div>
 
-It works through Valve's official **Game State Integration (GSI)**: the game itself
-POSTs its state (weapons, round phase) to a local HTTP endpoint. **No game memory
-is read or written.** Switching is done by simulating ordinary key presses —
-the same as any keyboard macro (AutoHotkey-style).
+<br/>
 
-![icon](icon.png)
+**QSmartSwap** allows you to press **one** hotkey and automatically equip the correct weapon based on what you're currently holding. It uses Valve's official **Game State Integration (GSI)** to accurately determine your active weapon and round state.
 
-## Features
+> 🛡️ **Safe & Secure:** No game memory is read or written. The app only receives data via a local HTTP server and sends standard keyboard events using a native Windows hook — exactly like any ordinary keyboard macro (e.g., AutoHotkey or Razer Synapse).
 
-- **Rule-based switching** — rows of *"if slot X is active → take slot Y"*,
-  add as many as you like (default: 3).
-- **Granular slots** — primary, secondary, knife, Zeus, C4, each grenade type
-  (HE / flash / smoke / decoy / molotov), generic grenade cycle, med-shot.
-  Grenades and Zeus are tracked separately, not lumped together.
-- **Any-complexity hotkey** — single keys and combos (`q`, `ctrl+q`,
-  `ctrl+shift+x`, mouse buttons). Matching is done by **scan code**, so binds
-  work in any keyboard layout (`q` == `й`), and **left/right modifiers and
-  numpad keys are distinct binds** (`right ctrl` ≠ `left ctrl`,
-  numpad-del ≠ `delete`).
-- **Missing-weapon fallback** — no primary in hands? Binds targeting primary
-  automatically go to the pistol (toggleable). No pistol? Redirect to primary /
-  knife / nothing — your choice.
-- **Kill hotkey** (`ctrl+end` by default) — quits the app instantly from anywhere,
-  no focus checks.
-- **Safety gates** — the hotkey is ignored when CS2 is not the focused window
-  and until a round is actually live (`warmup` / `freezetime` / `live` / `over`).
-- **Per-slot output keys** + one-click writer of `qsmartswap_binds.cfg`
-  auto-loaded via `autoexec.cfg` — no manual `exec` needed.
-- **GSI config installer** — finds CS2 through Steam libraries, writes the
-  `.cfg` for the selected port, cleans up stale configs from older versions.
-- **Server controls** — port selector (default `7777`, auto-start on launch)
-  with Start / Restart / Stop.
-- **System tray** — minimize to tray, tray icon menu.
-- **Bilingual UI** (RU/EN). Console output is always English.
-- Settings persist in `config.json` next to the app/exe.
+---
 
-## Requirements
+## ✨ Features
 
-- Windows 10/11 64-bit
-- Counter-Strike 2 installed via Steam
-- To run from source: Python 3.10+ with `pip install -r requirements.txt`
-  (PyQt6, keyboard, Pillow)
+- 🎯 **Rule-Based Switching:** Configure logical rows like *"if primary is active → take knife"* or *"if knife is active → take primary"*. Add as many rules as you want.
+- 🔫 **Granular Slot Tracking:** Tracks primary, secondary, knife, Zeus, C4, med-shots, and **each individual grenade type** (HE, flash, smoke, decoy, molotov) separately.
+- ⌨️ **Native Scan-Code Hotkeys:** Binds are tracked at the lowest hardware level using a custom Windows `WH_KEYBOARD_LL` hook.
+  - Independent of keyboard layouts (`Q` == `Й`).
+  - Distinguishes between Numpad and Navigation keys (e.g., `Num 7` ≠ `Home`).
+  - Distinguishes between Left and Right modifiers (`Left Ctrl` ≠ `Right Ctrl`).
+- 🔄 **Smart Missing-Weapon Fallbacks:** No primary in your hands? The app automatically falls back to your pistol. No pistol? It redirects to your knife. 
+- ⏱️ **Zero-Lag Prediction:** Optimistic state prediction bridges the ~100ms GSI delay, allowing lightning-fast double-presses (Q-Q) to work flawlessly.
+- 🛡️ **Safety Gates:** The hotkey strictly ignores inputs when CS2 is minimized, not in focus, or outside of a live round (ignores warmup/freezetime).
+- 🖥️ **High-DPI UI:** Built with PyQt6 and a native `PerMonitorV2` Windows manifest. Crisp, responsive, and beautiful on high-resolution displays.
+- ⚙️ **Automated Setup:** Automatically locates CS2, installs GSI configs, and writes `qsmartswap_binds.cfg` directly to your `autoexec.cfg`.
 
-## Quick start (prebuilt exe)
+---
 
-1. Run `QSmartSwap.exe`.
-2. Click **Install GSI config**, then **restart CS2** if it was running.
-3. Click **Write slot binds (.cfg)** so the game knows which keys select
-   `slot6`–`slot12` (the game loads them automatically on start).
-4. Set your switch hotkey with **Change...**, add rules if needed, join a match.
-5. Press the hotkey in game — the app swaps according to the first matching rule.
+## 🚀 Quick Start (Prebuilt)
 
-## Quick start (from source)
+1. Download and run `QSmartSwap.exe` from the latest release.
+2. Click **Install GSI config** (and restart CS2 if it was running).
+3. Click **Write slot binds (.cfg)**. This ensures CS2 binds keys to hidden slots (`slot6`–`slot12`).
+4. Set your **Switch Hotkey** via the `Capture` button.
+5. Join a match and press the hotkey — QSmartSwap will seamlessly cycle weapons based on your rules!
+
+---
+
+## 🛠️ Quick Start (From Source)
 
 ```bat
+git clone https://github.com/yourusername/QSmartSwap.git
+cd QSmartSwap
 pip install -r requirements.txt
 python main.py
 ```
 
-## How switching works
+### 📦 Building the Executable
 
-1. CS2 sends GSI packets to `http://127.0.0.1:7777/qsmartswap` (~10 Hz).
-2. The app tracks the active weapon and owned slots, plus the round phase.
-3. On your hotkey: find the first rule whose *"if active"* equals the real
-   active slot → apply missing-weapon fallback to the target if needed →
-   press the target slot's key.
-4. An optimistic prediction bridges the ~100 ms GSI lag, so fast double
-   presses alternate correctly instead of re-reading a stale weapon.
-
-### Default rules
-
-| If active | Take  |
-|-----------|-------|
-| primary   | knife |
-| knife     | primary |
-| secondary | primary |
-
-### Slot → Valve command map
-
-| Slot        | Valve command | Default key |
-|-------------|---------------|-------------|
-| primary     | `slot1`  | `1` |
-| secondary   | `slot2`  | `2` |
-| knife       | `slot3`  | `3` |
-| zeus        | `slot11` | *(none — set it yourself)* |
-| grenades (cycle) | `slot4` | `4` |
-| hegrenade   | `slot6`  | `6` |
-| flashbang   | `slot7`  | `7` |
-| smokegrenade| `slot8`  | `8` |
-| decoy       | `slot9`  | `9` |
-| molotov     | `slot10` | `0` |
-| c4          | `slot5`  | `5` |
-| med-shot    | `slot12` | `h` |
-
-> `slot6`–`slot12` are unbound in a fresh CS2 install — either bind the same
-> keys in game settings or use the **Write slot binds** button (recommended).
-
-## Files the app touches
-
-| File | Where | Purpose |
-|------|-------|---------|
-| `gamestate_integration_qsmartswap.cfg` | `.../csgo/cfg/` | Tells CS2 where to POST GSI data |
-| `qsmartswap_binds.cfg` | `.../csgo/cfg/` | `bind "<key>" "slotN"` lines generated from the slot table |
-| `autoexec.cfg` | `.../csgo/cfg/` | Appended with `exec qsmartswap_binds` once (never duplicated) |
-| `config.json` | next to the app | Your settings (never committed to git) |
-
-Changing the port rewrites the GSI config silently (log only) — restart the
-game afterwards.
-
-## Building the exe yourself
+To build the optimized `onedir` binary with the embedded High-DPI manifest and icons:
 
 ```bat
 pip install -r requirements.txt pyinstaller
-pyinstaller --onefile --windowed --name QSmartSwap --icon icon.ico --add-data "icon.png;." main.py
+pyinstaller -y --clean QSmartSwap.spec
 ```
+The compiled application will be generated in `dist/QSmartSwap/`.
 
-The binary lands in `dist/QSmartSwap.exe`. Keep `icon.png` next to it
-(it is also bundled as a fallback).
+---
 
-## Troubleshooting
+## 🕹️ How It Works
 
-| Symptom | Fix |
-|---------|-----|
-| Hotkey does nothing, console says `waiting for round start` | Click **Install GSI config** and **restart CS2** (old config lacks `round` data) |
-| Hotkey does nothing outside matches | By design: needs game focus + a live round |
-| `[hotkey] active=c4: no rule` | Add a rule with `c4` on the left side (e.g. `c4 → knife`) |
-| `Left ctrl` bind also fires on `Right ctrl` | Re-capture the bind — only freshly captured combos store exact scan codes |
-| Bind worked, then stopped after switching layout | Re-capture it; capture is layout-independent, typed strings are not |
-| Port busy / server won't start | Pick another port, press Restart, reinstall the GSI config |
+1. CS2 continuously sends GSI JSON packets to `http://127.0.0.1:7777/qsmartswap` at ~10 Hz.
+2. The app tracks the **active weapon**, **owned inventory slots**, and the **round phase**.
+3. Upon pressing your hotkey, the app:
+   - Finds the first rule matching your currently active slot.
+   - Applies fallbacks (e.g. if the target is `primary` but you don't own one).
+   - Simulates a raw `SendInput` keystroke mapped to the target weapon.
 
-## Fair-play note
+### 📋 Default Logic Rules
 
-GSI is Valve's official, documented integration channel. The app never reads
-or writes game memory; it only presses keys. That said, third-party
-anti-cheats (FaceIt, ESEA, 5EPlay, etc.) may dislike global keyboard hooks —
-use at your own discretion, especially the kill hotkey keeps you in control.
+| If holding... | Switch to... |
+|---------------|--------------|
+| `primary`     | `knife`      |
+| `knife`       | `primary`    |
+| `secondary`   | `primary`    |
 
-## Project layout
+### ⌨️ Slot → Valve Command Map
 
-| File | Role |
-|------|------|
-| `main.py` | PyQt6 UI: hotkeys, port/server, rules, slot keys, tray, console |
-| `hotkey_logic.py` | Combo matcher (scan codes), rules engine, fallback, prediction |
-| `gsi_server.py` | Local GSI HTTP server + weapon/round state |
-| `gsi_config.py` | GSI/bind/autoexec file builders |
-| `steam_locate.py` | Steam/CS2 install discovery via registry + `libraryfolders.vdf` |
-| `gsi_watch.py` | Standalone GSI packet inspector (debug tool) |
-| `i18n.py` | RU/EN strings |
+| Slot | Valve Command | Default Key |
+|------|---------------|-------------|
+| `primary` | `slot1` | `1` |
+| `secondary` | `slot2` | `2` |
+| `knife` | `slot3` | `3` |
+| `zeus` | `slot11` | *(none)* |
+| `c4` | `slot5` | `5` |
+| `hegrenade` | `slot6` | `6` |
+| `flashbang` | `slot7` | `7` |
+| `smokegrenade` | `slot8` | `8` |
+| `decoy` | `slot9` | `9` |
+| `molotov` | `slot10` | `0` |
+| `med-shot` | `slot12` | `h` |
+
+> *Note: Slots 6–12 are unbound in a fresh CS2 installation. Use the **Write slot binds** button in the app to automate binding these slots in-game.*
+
+---
+
+## 🗂️ Managed Files
+
+| File | Location | Purpose |
+|------|----------|---------|
+| `gamestate_integration_qsmartswap.cfg` | `.../csgo/cfg/` | Configures CS2 to POST GSI data to the app. |
+| `qsmartswap_binds.cfg` | `.../csgo/cfg/` | Generates the `bind "<key>" "slotN"` commands. |
+| `autoexec.cfg` | `.../csgo/cfg/` | Appends `exec qsmartswap_binds` so keys auto-load on start. |
+| `config.json` | Next to `QSmartSwap.exe` | Saves your app UI settings (never committed to git). |
+
+---
+
+## 🩺 Troubleshooting
+
+| Symptom | Solution |
+|---------|----------|
+| **Hotkey does nothing, console says `waiting for round start`** | Click **Install GSI config** and restart CS2. Older configs lack round data. |
+| **Hotkey does nothing outside matches** | By design. GSI prevents switching when not in a live round. |
+| **`[hotkey] active=c4: no rule`** | Add a custom rule with `c4` on the left side (e.g. `c4 → knife`). |
+| **Server won't start / Port busy** | Select a new port in the UI, click **Restart**, and reinstall the GSI config. |
+
+---
+
+## ⚖️ Fair-Play Note
+
+GSI is Valve's official, documented integration channel. QSmartSwap **never** reads or writes game memory; it solely relies on legitimate GSI data and standard OS keyboard simulation. However, aggressive third-party anti-cheats (FaceIt, ESEA) may block global keyboard hooks. Use at your own discretion on third-party matchmaking services.
+
+---
+<div align="center">
+  <i>Built with PyQt6 • Powered by CS2 Game State Integration</i>
+</div>
