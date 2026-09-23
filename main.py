@@ -46,6 +46,8 @@ from gsi_config import (
 )
 from gsi_server import LOGICAL_SLOTS, SLOT_IDS, VALVE_MAP, GsiServerThread, GsiState
 from hotkey_logic import DEFAULT_RULES, SLOT_KEYS_DEFAULT, HotkeyManager
+from native_hook import capture_combo
+from scancodes import combo_display, migrate_legacy_code
 from i18n import STRINGS, slot_label
 from steam_locate import find_cs2_root, get_cfg_dir
 
@@ -68,7 +70,7 @@ def resource_path(name: str) -> str:
     return os.path.join(BASE_DIR, name)
 
 
-ICON_PATH = resource_path("icon.png")
+ICON_PATH = resource_path("icon.ico")
 # QSMARTSWAP_CONFIG override exists so tests never touch the real config.json
 CONFIG_JSON = os.environ.get("QSMARTSWAP_CONFIG", os.path.join(BASE_DIR, "config.json"))
 DEFAULT_PORT = 7777
@@ -92,27 +94,63 @@ def save_settings(data: dict):
     try:
         with open(CONFIG_JSON, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
-    except OSError:
-        pass
+    except OSError as e:
+        print(f"!! Failed to save settings to {CONFIG_JSON}: {e}")
 
 
-def _clean_codes(groups):
-    """Sanitize stored scan-code groups: [[29],[16]] or None. Garbage -> None."""
+def _clean_codes(groups, log_callback=None):
+    """Sanitize and migrate stored scan-code groups to [{"scan": int, "extended": bool}]."""
     if not isinstance(groups, list) or not groups:
         return None
     out = []
     for g in groups:
         items = g if isinstance(g, list) else [g]
-        ints = [c for c in items if isinstance(c, int) and 0 <= c <= 0xFFFFFF]
-        if not ints:
+        cleaned_group = []
+        for c in items:
+            if isinstance(c, dict) and "scan" in c and "extended" in c:
+                cleaned_group.append({"scan": c["scan"], "extended": bool(c["extended"])})
+            elif isinstance(c, int):
+                # Legacy migration
+                scan, extended, ambiguous = migrate_legacy_code(c)
+                if ambiguous and log_callback:
+                    log_callback(f"⚠️ Migrated ambiguous legacy scan code {c} to scan={scan}, extended={extended}.")
+                cleaned_group.append({"scan": scan, "extended": extended})
+        if not cleaned_group:
             return None
-        out.append(ints)
+        out.append(cleaned_group)
     return out
+
+
+class CollapsibleBox(QWidget):
+    def __init__(self, title="", parent=None, is_expanded=False):
+        super().__init__(parent)
+        self.toggle_button = QPushButton(title)
+        self.toggle_button.setCheckable(True)
+        self.toggle_button.setChecked(is_expanded)
+        self.toggle_button.setStyleSheet("text-align: left; padding: 5px; font-weight: bold;")
+        self.toggle_button.toggled.connect(self.on_toggle)
+        
+        self.content_area = QWidget()
+        self.content_layout = QVBoxLayout(self.content_area)
+        self.content_layout.setContentsMargins(0, 5, 0, 0)
+        self.content_area.setVisible(is_expanded)
+        
+        lay = QVBoxLayout(self)
+        lay.setSpacing(0)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(self.toggle_button)
+        lay.addWidget(self.content_area)
+        
+    def on_toggle(self, checked):
+        self.content_area.setVisible(checked)
+        
+    def setTitle(self, title):
+        self.toggle_button.setText(title)
 
 
 class MainWindow(QMainWindow):
     log_signal = pyqtSignal(str)
-    hotkey_captured = pyqtSignal(str)
+    hotkey_captured = pyqtSignal(str, object)
     quit_signal = pyqtSignal()
 
     def __init__(self):
@@ -131,8 +169,8 @@ class MainWindow(QMainWindow):
         self._capture_target = "main"
         self._captured_codes = None
         # exact scan-code groups from capture (None = legacy string bind)
-        self._main_codes = _clean_codes(self.settings.get("hotkey_sc"))
-        self._kill_codes = _clean_codes(self.settings.get("kill_sc"))
+        self._main_codes = _clean_codes(self.settings.get("hotkey_sc"), self._log_no_emit)
+        self._kill_codes = _clean_codes(self.settings.get("kill_sc"), self._log_no_emit)
         self.rule_rows: list[dict] = []  # {active: QComboBox, target: QComboBox}
         self.slot_edits: dict[str, QLineEdit] = {}
         # guard: while UI is being built the fields are still empty —
@@ -165,6 +203,9 @@ class MainWindow(QMainWindow):
 
         self._loading = False
 
+    def _log_no_emit(self, msg: str):
+        print(msg)
+
     # --- UI ---
 
     def _build_ui(self):
@@ -175,7 +216,11 @@ class MainWindow(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main = QVBoxLayout(central)
+        main.setSizeConstraint(QVBoxLayout.SizeConstraint.SetFixedSize)
         main.setSpacing(6)
+        
+        # Накладываем ограничение и на компоновщик самого окна, чтобы оно сжималось нативно
+        self.layout().setSizeConstraint(QVBoxLayout.SizeConstraint.SetFixedSize)
 
         # хоткей
         row_hotkey = QHBoxLayout()
@@ -230,8 +275,9 @@ class MainWindow(QMainWindow):
         main.addLayout(row_status)
 
         # правила
-        self.grp_rules = QGroupBox()
-        rules_layout = QVBoxLayout(self.grp_rules)
+        self.grp_rules = CollapsibleBox(is_expanded=self.settings.get("ui_rules_open", True))
+        self.grp_rules.toggle_button.toggled.connect(lambda: self._persist())
+        rules_layout = self.grp_rules.content_layout
         rules_header = QHBoxLayout()
         self.lbl_rule_if = QLabel()
         self.lbl_rule_then = QLabel()
@@ -264,15 +310,15 @@ class MainWindow(QMainWindow):
         main.addWidget(self.grp_rules)
 
         # клавиши слотов
-        self.grp_slots = QGroupBox()
-        slots_outer = QVBoxLayout(self.grp_slots)
+        self.grp_slots = CollapsibleBox(is_expanded=self.settings.get("ui_slots_open", False))
+        self.grp_slots.toggle_button.toggled.connect(lambda: self._persist())
+        slots_outer = self.grp_slots.content_layout
         self.slots_grid = QGridLayout()
         slots_outer.addLayout(self.slots_grid)
         for i, slot in enumerate(SLOT_IDS):
             lbl = QLabel()
             lbl.setProperty("slot", slot)
             edit = QLineEdit()
-            edit.setMaximumWidth(90)
             edit.setProperty("slot", slot)
             edit.editingFinished.connect(self._on_slot_keys_changed)
             self.slot_edits[slot] = edit
@@ -289,13 +335,39 @@ class MainWindow(QMainWindow):
         main.addWidget(self.grp_slots)
 
         # консоль
-        self.lbl_console = QLabel()
-        main.addWidget(self.lbl_console)
+        self.grp_console = CollapsibleBox(is_expanded=self.settings.get("ui_console_open", False))
+        self.grp_console.toggle_button.toggled.connect(lambda: self._persist())
         self.console = QPlainTextEdit()
         self.console.setReadOnly(True)
         self.console.setMaximumBlockCount(500)
-        self.console.setFixedHeight(110)
-        main.addWidget(self.console)
+        self.console.setMinimumHeight(110)
+        self.grp_console.content_layout.addWidget(self.console)
+        main.addWidget(self.grp_console)
+
+        # Settings
+        self.grp_settings = CollapsibleBox(is_expanded=self.settings.get("ui_settings_open", False))
+        self.grp_settings.toggle_button.toggled.connect(lambda: self._persist())
+        
+        self.chk_start_minimized = QCheckBox("Start Minimized to Tray")
+        self.chk_start_minimized.setChecked(self.settings.get("start_minimized", False))
+        self.chk_start_minimized.stateChanged.connect(lambda: self._persist())
+        self.grp_settings.content_layout.addWidget(self.chk_start_minimized)
+        
+        row_cs2 = QHBoxLayout()
+        self.lbl_cs2_path = QLabel("CS2 Path:")
+        self.edit_cs2_path = QLineEdit(self.settings.get("cs2_path", ""))
+        self.edit_cs2_path.setPlaceholderText("Auto-detect (or browse...)")
+        self.edit_cs2_path.editingFinished.connect(lambda: self._persist())
+        self.btn_cs2_browse = QPushButton("Browse...")
+        self.btn_cs2_browse.clicked.connect(self._browse_cs2_path)
+        self.btn_cs2_detect = QPushButton("Auto")
+        self.btn_cs2_detect.clicked.connect(self._detect_cs2_path)
+        row_cs2.addWidget(self.lbl_cs2_path)
+        row_cs2.addWidget(self.edit_cs2_path, 1)
+        row_cs2.addWidget(self.btn_cs2_browse)
+        row_cs2.addWidget(self.btn_cs2_detect)
+        self.grp_settings.content_layout.addLayout(row_cs2)
+        main.addWidget(self.grp_settings)
 
         # низ
         row_bottom = QHBoxLayout()
@@ -357,7 +429,8 @@ class MainWindow(QMainWindow):
         self.grp_slots.setTitle(self.t("slotkeys_title"))
         self.btn_slots_reset.setText(self.t("slotkeys_reset"))
         self.btn_slots_write.setText(self.t("slotkeys_write"))
-        self.lbl_console.setText(self.t("console_label"))
+        self.grp_console.setTitle(self.t("console_label"))
+        self.grp_settings.setTitle("Settings")
         self.btn_install.setText(self.t("install_cfg"))
         self.lbl_lang.setText(self.t("lang_label"))
         self.btn_tray.setText(self.t("minimize_tray"))
@@ -425,6 +498,12 @@ class MainWindow(QMainWindow):
                 for r in self.rule_rows
             ],
             "slot_keys": {s: e.text().strip() for s, e in self.slot_edits.items()},
+            "ui_rules_open": self.grp_rules.toggle_button.isChecked(),
+            "ui_slots_open": self.grp_slots.toggle_button.isChecked(),
+            "ui_console_open": self.grp_console.toggle_button.isChecked(),
+            "ui_settings_open": self.grp_settings.toggle_button.isChecked(),
+            "cs2_path": self.edit_cs2_path.text().strip(),
+            "start_minimized": self.chk_start_minimized.isChecked(),
         }
 
     def _persist(self):
@@ -521,38 +600,32 @@ class MainWindow(QMainWindow):
         self._prev_kill_codes = list(self._kill_codes or [])
         self._captured_codes = None
         # останавливаем старый хук чтобы он не срабатывал во время захвата
-        try:
-            self.hotkey_mgr.stop()
-        except Exception:  # noqa: BLE001
-            pass
+        self.hotkey_mgr.stop()
+        
         btn = self.btn_kill if target == "kill" else self.btn_hotkey
         btn.setText(self.t("hotkey_capture"))
 
         def worker():
             try:
-                from hotkey_logic import capture_combo, combo_display
-
                 # scan-code capture: left/right/numpad are distinct binds
                 codes = capture_combo(timeout=30.0)
                 if codes is None:
-                    self._captured_codes = None
-                    self.hotkey_captured.emit("")
+                    self.hotkey_captured.emit("", None)
                 else:
-                    self._captured_codes = codes
-                    self.hotkey_captured.emit(combo_display(codes))
+                    # Convert list of tuples to list of dicts for storage
+                    stored_codes = [{"scan": sc, "extended": ext} for sc, ext in codes]
+                    self.hotkey_captured.emit(combo_display(codes, lang=self.lang), [stored_codes])
             except Exception as e:  # noqa: BLE001
                 self.log_signal.emit(f"!! Hotkey capture failed: {e}")
-                self._captured_codes = None
-                self.hotkey_captured.emit("")
+                self.hotkey_captured.emit("", None)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _on_hotkey_captured(self, hk: str):
+    def _on_hotkey_captured(self, hk: str, codes: object):
         self._capturing = False
         self.btn_hotkey.setText(self.t("hotkey_change"))
         self.btn_kill.setText(self.t("hotkey_change"))
         hk = (hk or "").strip()
-        codes = getattr(self, "_captured_codes", None)
         if not hk or not codes:
             # отмена — возвращаем старые хоткеи
             self.hotkey_mgr.start(
@@ -580,7 +653,7 @@ class MainWindow(QMainWindow):
 
     def _on_kill_hotkey(self):
         self._log("Kill hotkey pressed — exiting")
-        self.close()
+        self._force_quit()
 
     # --- сервер ---
 
@@ -629,17 +702,35 @@ class MainWindow(QMainWindow):
     def server_running(self) -> bool:
         return self.server_thread is not None and self.server_thread.is_alive()
 
+    def _get_cs2_root(self):
+        return find_cs2_root(self.settings.get("cs2_path"))
+
+    def _browse_cs2_path(self):
+        chosen = QFileDialog.getExistingDirectory(self, self.t("choose_cs2_folder"), os.path.expanduser("~"))
+        if chosen:
+            self.edit_cs2_path.setText(chosen)
+            self._persist()
+
+    def _detect_cs2_path(self):
+        res = find_cs2_root(None)
+        if res:
+            self.edit_cs2_path.setText(res)
+            self._log(f"CS2 Auto-detected: {res}")
+            self._persist()
+        else:
+            self._log("Failed to auto-detect CS2 path.")
+
     # --- GSI конфиг ---
 
     def _install_cfg(self):
         port = self.spin_port.value()
-        cs2_root = find_cs2_root()
+        cs2_root = self._get_cs2_root()
         if not cs2_root:
             QMessageBox.warning(self, "QSmartSwap", self.t("err_no_steam"))
-            chosen = QFileDialog.getExistingDirectory(self, self.t("choose_cs2_folder"), os.path.expanduser("~"))
-            if not chosen:
+            self._browse_cs2_path()
+            cs2_root = self._get_cs2_root()
+            if not cs2_root:
                 return
-            cs2_root = chosen
         try:
             cfg_dir = get_cfg_dir(cs2_root)
             target = install_config(cfg_dir, port, GSI_PATH)
@@ -656,7 +747,7 @@ class MainWindow(QMainWindow):
         (The old code rewrote the file and popped up on EVERY launch because
         _persist() dropped the cfg_autoinstalled flag — fixed as well.)"""
         try:
-            cs2_root = find_cs2_root()
+            cs2_root = self._get_cs2_root()
         except Exception:  # noqa: BLE001
             cs2_root = None
         if not cs2_root:
@@ -689,13 +780,13 @@ class MainWindow(QMainWindow):
         self._writing_binds = True
         try:
             slot_keys = {s: e.text().strip() for s, e in self.slot_edits.items()}
-            cs2_root = find_cs2_root()
+            cs2_root = self._get_cs2_root()
             if not cs2_root:
                 QMessageBox.warning(self, "QSmartSwap", self.t("err_no_steam"))
-                chosen = QFileDialog.getExistingDirectory(self, self.t("choose_cs2_folder"), os.path.expanduser("~"))
-                if not chosen:
+                self._browse_cs2_path()
+                cs2_root = self._get_cs2_root()
+                if not cs2_root:
                     return
-                cs2_root = chosen
             try:
                 cfg_dir = get_cfg_dir(cs2_root)
                 target, warnings, autoexec = install_binds(cfg_dir, slot_keys, VALVE_MAP)
@@ -767,7 +858,20 @@ class MainWindow(QMainWindow):
 
     def _quit_from_tray(self):
         self.tray.hide()
-        self.close()
+        self._force_quit()
+
+    def _force_quit(self):
+        """Full cleanup + hard quit regardless of window visibility."""
+        self._persist()
+        try:
+            self.hotkey_mgr.stop()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.stop_server(silent=True)
+        except Exception:  # noqa: BLE001
+            pass
+        QApplication.quit()
 
     def closeEvent(self, event):
         self._persist()
@@ -780,14 +884,25 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001
             pass
         event.accept()
+        QApplication.quit()
 
 
 def main():
+    # Per-Monitor DPI awareness V2
+    QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
     win = MainWindow()
-    win.resize(600, 720)
-    win.show()
+    
+    if win.settings.get("start_minimized", False):
+        if QSystemTrayIcon.isSystemTrayAvailable():
+            win._hide_to_tray()
+        else:
+            win.show()
+    else:
+        win.show()
+    
     sys.exit(app.exec())
 
 
