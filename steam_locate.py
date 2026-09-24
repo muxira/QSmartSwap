@@ -18,14 +18,19 @@ CS_FOLDER_NAME = "Counter-Strike Global Offensive"
 
 def find_steam_path() -> str | None:
     """Возвращает путь к папке Steam, либо None если не найдено."""
-    try:
-        key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam")
-        path, _ = winreg.QueryValueEx(key, "SteamPath")
-        winreg.CloseKey(key)
-        if path and os.path.isdir(path):
-            return os.path.normpath(path)
-    except OSError:
-        pass
+    for hive, subkey in (
+        (winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\Valve\Steam"),
+        (winreg.HKEY_LOCAL_MACHINE, r"Software\WOW6432Node\Valve\Steam"),
+    ):
+        try:
+            key = winreg.OpenKey(hive, subkey)
+            path, _ = winreg.QueryValueEx(key, "SteamPath")
+            winreg.CloseKey(key)
+            if path and os.path.isdir(path):
+                return os.path.normpath(path)
+        except OSError:
+            continue
 
     # запасные варианты, если реестр не помог
     for candidate in (
@@ -63,11 +68,14 @@ def _parse_library_folders(steam_path: str) -> list[str]:
     return libraries
 
 
-def find_cs2_root() -> str | None:
+def find_cs2_root(explicit_path: str | None = None) -> str | None:
     """
     Возвращает корневую папку установки CS2
     (ту, что содержит подпапку "game"), либо None.
     """
+    if explicit_path and os.path.isdir(os.path.join(explicit_path, "game")):
+        return explicit_path
+
     steam_path = find_steam_path()
     if not steam_path:
         return None

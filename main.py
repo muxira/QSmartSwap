@@ -13,7 +13,7 @@ import sys
 import threading
 
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal
-from PyQt6.QtGui import QAction, QIcon
+from PyQt6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -49,6 +49,7 @@ from hotkey_logic import DEFAULT_RULES, SLOT_KEYS_DEFAULT, HotkeyManager
 from native_hook import capture_combo
 from scancodes import combo_display, migrate_legacy_code
 from i18n import STRINGS, slot_label
+from game_watch import is_game_running
 from steam_locate import find_cs2_root, get_cfg_dir
 
 if getattr(sys, "frozen", False):
@@ -61,22 +62,61 @@ else:
 
 
 def resource_path(name: str) -> str:
-    """Find a bundled asset: exe dir first, then PyInstaller temp dir."""
+    """Find a bundled asset: exe dir first, then PyInstaller dirs.
+
+    NOTE: with --onedir, --add-data lands in <exe>/_internal/, NOT next to
+    the exe (and sys._MEIPASS == exe dir there), so _internal must be probed
+    explicitly — otherwise the tray ends up with a null (invisible) icon.
+    """
+    search = []
     for base in (BASE_DIR, _MEIPASS):
         if base:
-            candidate = os.path.join(base, name)
-            if os.path.isfile(candidate):
-                return candidate
+            search.append(base)
+            search.append(os.path.join(base, "_internal"))
+    for base in search:
+        candidate = os.path.join(base, name)
+        if os.path.isfile(candidate):
+            return candidate
     return os.path.join(BASE_DIR, name)
 
 
-ICON_PATH = resource_path("icon.ico")
+def find_icon() -> str:
+    for name in ("icon.ico", "icon.png"):
+        path = resource_path(name)
+        if os.path.isfile(path):
+            return path
+    return os.path.join(BASE_DIR, "icon.ico")
+
+
+ICON_PATH = find_icon()
+
+_app_icon: QIcon | None = None
+
+
+def app_icon() -> QIcon:
+    """Window/tray icon that is NEVER null: falls back to a drawn badge
+    if no icon file is found in the bundle."""
+    global _app_icon
+    if _app_icon is None or _app_icon.isNull():
+        icon = QIcon(ICON_PATH) if os.path.isfile(ICON_PATH) else QIcon()
+        if icon.isNull():
+            pm = QPixmap(64, 64)
+            pm.fill(QColor("#181818"))
+            painter = QPainter(pm)
+            painter.setPen(QColor("#ff7a00"))
+            painter.setFont(QFont("Arial", 40, QFont.Weight.Bold))
+            painter.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter, "Q")
+            painter.end()
+            icon = QIcon(pm)
+        _app_icon = icon
+    return _app_icon
 # QSMARTSWAP_CONFIG override exists so tests never touch the real config.json
 CONFIG_JSON = os.environ.get("QSMARTSWAP_CONFIG", os.path.join(BASE_DIR, "config.json"))
 DEFAULT_PORT = 7777
 DEFAULT_HOTKEY = "q"
 DEFAULT_KILL_HOTKEY = "ctrl+end"
 DEFAULT_LANG = "ru"
+APP_VERSION = "1.1.0"
 
 
 def load_settings() -> dict:
@@ -197,6 +237,13 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self._refresh_status)
         self.timer.start(500)
 
+        # вотчер игры: выходим сами, когда cs2.exe закрылся (если галочка вкл).
+        # _game_was_seen страхует от выхода при старте, когда игры ещё нет.
+        self._game_was_seen = False
+        self.game_timer = QTimer(self)
+        self.game_timer.timeout.connect(self._poll_game_exit)
+        self.game_timer.start(2000)
+
         # первый запуск: если GSI-конфига нет — ставим сами и показываем
         # попап про перезапуск игры (иначе round.phase не прилетит никогда)
         QTimer.singleShot(600, self._first_run_check)
@@ -209,9 +256,8 @@ class MainWindow(QMainWindow):
     # --- UI ---
 
     def _build_ui(self):
-        self.setWindowTitle(self.t("title"))
-        if os.path.isfile(ICON_PATH):
-            self.setWindowIcon(QIcon(ICON_PATH))
+        self.setWindowTitle(f"{self.t('title')} v{APP_VERSION}")
+        self.setWindowIcon(app_icon())
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -245,6 +291,15 @@ class MainWindow(QMainWindow):
         row_kill.addWidget(self.kill_edit, 1)
         row_kill.addWidget(self.btn_kill)
         main.addLayout(row_kill)
+
+        # автовыход вместе с игрой — галочка рядом с киллбиндом
+        row_exit = QHBoxLayout()
+        self.chk_autoexit = QCheckBox()
+        self.chk_autoexit.setChecked(bool(self.settings.get("autoexit_on_game_close", False)))
+        self.chk_autoexit.stateChanged.connect(self._on_autoexit_changed)
+        row_exit.addWidget(self.chk_autoexit)
+        row_exit.addStretch(1)
+        main.addLayout(row_exit)
 
         # порт + сервер
         row_port = QHBoxLayout()
@@ -389,8 +444,7 @@ class MainWindow(QMainWindow):
 
         # трей
         self.tray = QSystemTrayIcon(self)
-        if os.path.isfile(ICON_PATH):
-            self.tray.setIcon(QIcon(ICON_PATH))
+        self.tray.setIcon(app_icon())
         menu = QMenu()
         self.act_show = QAction()
         self.act_show.triggered.connect(self._show_from_tray)
@@ -406,11 +460,12 @@ class MainWindow(QMainWindow):
             self.add_rule_row(r.get("active"), r.get("target"))
 
     def _retranslate(self):
-        self.setWindowTitle(self.t("title"))
+        self.setWindowTitle(f"{self.t('title')} v{APP_VERSION}")
         self.lbl_hotkey.setText(self.t("hotkey_label"))
         self.btn_hotkey.setText(self.t("hotkey_change"))
         self.lbl_kill.setText(self.t("kill_label"))
         self.btn_kill.setText(self.t("hotkey_change"))
+        self.chk_autoexit.setText(self.t("autoexit"))
         self.lbl_port.setText(self.t("port_label"))
         self.btn_start.setText(self.t("server_start"))
         self.btn_restart.setText(self.t("server_restart"))
@@ -474,6 +529,9 @@ class MainWindow(QMainWindow):
         self.combo_pf.blockSignals(True)
         self.combo_pf.setCurrentIndex(idx if idx >= 0 else 0)
         self.combo_pf.blockSignals(False)
+        self.chk_autoexit.blockSignals(True)
+        self.chk_autoexit.setChecked(bool(self.settings.get("autoexit_on_game_close", False)))
+        self.chk_autoexit.blockSignals(False)
         slot_keys = self.settings.get("slot_keys") or {}
         for slot in SLOT_IDS:
             # `or` (not get-with-default): heals configs wiped by the old
@@ -493,6 +551,7 @@ class MainWindow(QMainWindow):
             "lang": self.lang,
             "fallback_primary": self.chk_fallback.isChecked(),
             "pistol_fallback": self.combo_pf.currentData() or "nothing",
+            "autoexit_on_game_close": self.chk_autoexit.isChecked(),
             "rules": [
                 {"active": r["active"].currentData(), "target": r["target"].currentData()}
                 for r in self.rule_rows
@@ -523,6 +582,24 @@ class MainWindow(QMainWindow):
         self.hotkey_mgr.pistol_fallback = self.combo_pf.currentData() or "nothing"
         self._log(f"Pistol fallback: {self.hotkey_mgr.pistol_fallback}")
         self._persist()
+
+    def _on_autoexit_changed(self):
+        on = self.chk_autoexit.isChecked()
+        self._log(f"Auto-exit on game close {'ON' if on else 'OFF'}")
+        self._persist()
+
+    def _poll_game_exit(self):
+        """Раз в 2 сек: игра была и пропала + галочка вкл → закрываемся."""
+        try:
+            running = is_game_running()
+        except Exception:  # noqa: BLE001
+            return
+        if running:
+            self._game_was_seen = True
+            return
+        if self._game_was_seen and self.chk_autoexit.isChecked():
+            self._log("Game process ended — auto-exit enabled, quitting")
+            self.close()
 
     # --- правила ---
 
@@ -674,8 +751,38 @@ class MainWindow(QMainWindow):
             # keep GSI config in sync with the port (no popup — just log)
             self._sync_cfg_with_port(port)
 
+    def _notify_restart_required(self, path: str):
+        """Restart reminder that also reaches tray-started users.
+
+        A modal box parented to a hidden window may never appear on Windows,
+        so when the main window is hidden we show a parentless topmost dialog.
+        """
+        title = self.t("popup_title")
+        text = self.t("popup_text").format(path=path)
+        if self.isVisible():
+            QMessageBox.information(self, title, text)
+            return
+        box = QMessageBox(
+            QMessageBox.Icon.Information,
+            title,
+            text,
+            QMessageBox.StandardButton.Ok,
+            None,
+        )
+        box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+        box.setModal(True)
+        box.show()
+        box.raise_()
+        box.activateWindow()
+        box.exec()
+
     def _sync_cfg_with_port(self, port: int):
-        """Silently rewrite GSI config if it differs (e.g. port changed)."""
+        """Rewrite GSI config if it differs (e.g. template or port changed).
+
+        Popup only when it matters: the game reads the cfg once at startup,
+        so a restart reminder is shown iff the game process is running
+        right now. Otherwise a log line is enough.
+        """
         try:
             cs2_root = find_cs2_root()
             if not cs2_root:
@@ -685,8 +792,25 @@ class MainWindow(QMainWindow):
             if read_config_text(cfg_dir) != expected:
                 target = install_config(cfg_dir, port, GSI_PATH)
                 self._log(f"GSI config updated for port {port}: {target} (restart game if running)")
+                try:
+                    game_running = is_game_running()
+                except Exception:  # noqa: BLE001
+                    game_running = False
+                if game_running:
+                    # defer: showing a modal dialog synchronously here is
+                    # unreliable (init may be unfinished / window hidden to
+                    # tray). When the timer fires the UI is settled.
+                    self._pending_restart_notice = target
+                    self._log("Game is running — restart reminder scheduled")
+                    QTimer.singleShot(1500, self._flush_restart_notice)
         except Exception:  # noqa: BLE001
             pass
+
+    def _flush_restart_notice(self):
+        path = getattr(self, "_pending_restart_notice", None)
+        self._pending_restart_notice = None
+        if path:
+            self._notify_restart_required(path)
 
     def stop_server(self, silent: bool = False):
         if self.server_thread:
@@ -770,7 +894,7 @@ class MainWindow(QMainWindow):
             return
         self.settings["cfg_autoinstalled"] = True
         self._persist()
-        QMessageBox.information(self, self.t("popup_title"), self.t("popup_text").format(path=target))
+        self._notify_restart_required(target)
         self._log(f"GSI config written: {target} (port {self.spin_port.value()})")
 
     def _write_binds(self):
@@ -824,12 +948,14 @@ class MainWindow(QMainWindow):
             self.lbl_server_status.setText(self.t("status_server_off"))
         snap = self.state.snapshot()
         phase = snap.get("round_phase") or "-"
+        mmap = snap.get("map_phase") or "-"
+        act = snap.get("player_activity") or "-"
         if snap["connected"] and snap["active_slot"]:
             owned = ",".join(snap["owned"]) or "-"
             base = self.t("status_gsi_ok").format(active=snap["active_slot"], owned=owned)
-            self.lbl_gsi_status.setText(f"{base} | round={phase}")
+            self.lbl_gsi_status.setText(f"{base} | round={phase} map={mmap} act={act}")
         else:
-            self.lbl_gsi_status.setText(f"{self.t('status_gsi_wait')} (round={phase})")
+            self.lbl_gsi_status.setText(f"{self.t('status_gsi_wait')} (round={phase} map={mmap} act={act})")
 
     # --- язык/трей/выход ---
 
@@ -874,6 +1000,7 @@ class MainWindow(QMainWindow):
         QApplication.quit()
 
     def closeEvent(self, event):
+        self._pending_restart_notice = None
         self._persist()
         try:
             self.hotkey_mgr.stop()

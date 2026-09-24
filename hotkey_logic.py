@@ -338,7 +338,14 @@ class HotkeyManager:
             self._quiet("[hotkey] waiting for round start (no round.phase — reinstall GSI config)")
             return
         if not snap.get("armed"):
-            self._quiet(f"[hotkey] round not live (phase={snap.get('round_phase')}) — waiting")
+            if snap.get("match_over"):
+                self._quiet(f"[hotkey] match over (map={snap.get('map_phase')}) — presses disabled")
+            elif snap.get("in_menu"):
+                self._quiet("[hotkey] in menu — left the match, presses disabled")
+            elif snap.get("stale"):
+                self._quiet("[hotkey] no live GSI data — left the match? presses disabled")
+            else:
+                self._quiet(f"[hotkey] round not live (round={snap.get('round_phase')}) — waiting")
             return
 
         owned = snap.get("owned", [])

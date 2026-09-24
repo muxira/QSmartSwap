@@ -12,7 +12,9 @@
 import json
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
-PORT = 3000
+from gsi_config import GSI_PORT
+
+PORT = GSI_PORT
 
 
 class GSIHandler(BaseHTTPRequestHandler):

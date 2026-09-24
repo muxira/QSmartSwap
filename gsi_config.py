@@ -29,7 +29,7 @@ def build_cfg_content(port: int = GSI_PORT, path: str = GSI_PATH) -> str:
     "timeout" "5.0"
     "buffer"  "0.1"
     "throttle" "0.1"
-    "heartbeat" "30.0"
+    "heartbeat" "3.0"
     "data"
     {{
         "provider"       "1"

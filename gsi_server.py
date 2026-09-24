@@ -45,6 +45,14 @@ VALVE_MAP = {slot: LOGICAL_SLOTS[slot]["valve"] for slot in SLOT_IDS}
 # Round phases where swapping is allowed (weapon actually in hands,
 # including "over" so binds keep working between rounds).
 ARMED_ROUND_PHASES = {"warmup", "freezetime", "live", "over"}
+# Map phases where the match is over: presses stop registering even if
+# round.phase still says "over". Unknown map phases don't disarm (lenient).
+DISARMED_MAP_PHASES = {"intermission", "gameover"}
+# Player activity meaning "not in a match" (disconnect / kick / ban / menu).
+MENU_ACTIVITIES = {"menu"}
+# No live (weapons/round/map) data for this long -> link is gone, probably
+# left the match. Heartbeats don't count: only meaningful packets refresh it.
+GSI_STALE_S = 5.0
 
 
 def weapon_to_slot(wname: str, wtype: str) -> str:
@@ -96,16 +104,33 @@ class GsiState:
         self.last_raw_summary = ""
         self.round_phase: str | None = None
         self.round_seen = False
+        self.map_phase: str | None = None
+        self.map_seen = False
+        self.player_activity: str | None = None
+        self.activity_seen = False
+        self.last_live_update = 0.0
 
     def update_from_payload(self, data: dict) -> dict:
         """Разбирает GSI-пакет. Возвращает новый снапшот."""
-        weapons = data.get("player", {}).get("weapons", {}) or {}
+        player_info = data.get("player") or {}
+        weapons = player_info.get("weapons", {}) or {}
+        activity = player_info.get("activity")
+        if isinstance(activity, str):
+            activity = activity.lower()
+        else:
+            activity = None
         round_info = data.get("round") or {}
         phase = round_info.get("phase")
         if isinstance(phase, str):
             phase = phase.lower()
         else:
             phase = None
+        map_info = data.get("map") or {}
+        map_phase = map_info.get("phase")
+        if isinstance(map_phase, str):
+            map_phase = map_phase.lower()
+        else:
+            map_phase = None
 
         owned: set[str] = set()
         found_active: str | None = None
@@ -131,6 +156,16 @@ class GsiState:
             if phase is not None:
                 self.round_phase = phase
                 self.round_seen = True
+            if map_phase is not None:
+                self.map_phase = map_phase
+                self.map_seen = True
+            if activity is not None:
+                self.player_activity = activity
+                self.activity_seen = True
+            # liveness: only meaningful packets count — menu heartbeats
+            # (provider-only) must NOT mask a disconnect
+            if weapons or phase is not None or map_phase is not None:
+                self.last_live_update = time.time()
             # пустой пакет (смерть/спектатор/меню) — инвентарь не затираем,
             # иначе правила будут думать что оружия нет
             if weapons:
@@ -146,10 +181,17 @@ class GsiState:
 
     def _snapshot_locked(self) -> dict:
         owned = set(self.owned)
+        now = time.time()
+        match_over = self.map_seen and (self.map_phase in DISARMED_MAP_PHASES)
+        in_menu = self.activity_seen and (self.player_activity in MENU_ACTIVITIES)
+        stale = self.last_live_update > 0 and (now - self.last_live_update) > GSI_STALE_S
         armed = (
             self.connected
             and self.round_seen
             and (self.round_phase in ARMED_ROUND_PHASES)
+            and not match_over
+            and not in_menu
+            and not stale
         )
         return {
             "active_slot": self.active_slot,
@@ -160,6 +202,13 @@ class GsiState:
             "connected": self.connected,
             "round_phase": self.round_phase,
             "round_seen": self.round_seen,
+            "map_phase": self.map_phase,
+            "map_seen": self.map_seen,
+            "match_over": match_over,
+            "player_activity": self.player_activity,
+            "activity_seen": self.activity_seen,
+            "in_menu": in_menu,
+            "stale": stale,
             "armed": armed,
             "last_update": self.last_update,
             "summary": self.last_raw_summary,
@@ -198,10 +247,12 @@ def _make_handler(state: GsiState, log_callback, expected_path: str):
                 (new["active_slot"] != old["active_slot"])
                 or (new["owned"] != old["owned"])
                 or (new["round_phase"] != old["round_phase"])
+                or (new["map_phase"] != old["map_phase"])
+                or (new["player_activity"] != old["player_activity"])
             ):
                 log_callback(
                     f"active={new['active_slot']} owned={','.join(new['owned']) or '-'} "
-                    f"round={new['round_phase']}"
+                    f"round={new['round_phase']} map={new['map_phase']} act={new['player_activity']}"
                 )
 
     return Handler
