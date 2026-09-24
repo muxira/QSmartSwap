@@ -115,7 +115,7 @@ CONFIG_JSON = os.environ.get("QSMARTSWAP_CONFIG", os.path.join(BASE_DIR, "config
 DEFAULT_PORT = 7777
 DEFAULT_HOTKEY = "q"
 DEFAULT_KILL_HOTKEY = "ctrl+end"
-DEFAULT_LANG = "ru"
+DEFAULT_LANG = "en"
 APP_VERSION = "1.1.0"
 
 
